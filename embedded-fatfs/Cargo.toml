@@ -36,7 +36,7 @@ default = ["chrono", "std", "alloc", "lfn", "unicode", "log"]
 
 [dependencies]
 # core deps
-bitflags = "1.0"
+bitflags = "2.6.0"
 embedded-io-async = "0.6.1"
 
 # optional deps
@@ -48,6 +48,6 @@ log = { version = "0.4", optional = true }
 defmt = { version = "0.3", optional = true }
 
 [dev-dependencies]
-env_logger = "0.9"
+env_logger = "0.11.5"
 tokio = { version = "1", default-features = false, features = ["fs", "rt-multi-thread", "macros", "io-util"] }
 anyhow = "1"

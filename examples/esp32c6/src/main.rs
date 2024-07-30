@@ -9,40 +9,50 @@ use embedded_hal_async::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::{Read, Seek, Write};
 use esp_backtrace as _;
+use esp_hal::gpio::Io;
+use esp_hal::gpio::Level;
+use esp_hal::gpio::Output;
+use esp_hal::system::SystemControl;
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::timer::ErasedTimer;
+use esp_hal::timer::OneShotTimer;
 use esp_hal::{
     clock::ClockControl,
     dma::Dma,
     dma::DmaPriority,
-    dma_descriptors, embassy,
+    dma_descriptors,
     peripherals::Peripherals,
     prelude::*,
     spi::{
         master::{prelude::*, Spi},
         SpiMode,
     },
-    FlashSafeDma, IO,
+    FlashSafeDma,
 };
 use sdspi::SdSpi;
+use static_cell::StaticCell;
 
 #[main]
 async fn main(_spawner: Spawner) {
     let peripherals = Peripherals::take();
-    let system = peripherals.SYSTEM.split();
+    let system = SystemControl::new(peripherals.SYSTEM);
     let clocks = ClockControl::max(system.clock_control).freeze();
+    let timg0 = TimerGroup::new(peripherals.TIMG0, &clocks, None);
 
-    embassy::init(
+    static ONE_SHOT_TIMER: StaticCell<[OneShotTimer<ErasedTimer>; 1]> = StaticCell::new();
+    esp_hal_embassy::init(
         &clocks,
-        esp_hal::systimer::SystemTimer::new(peripherals.SYSTIMER),
+        ONE_SHOT_TIMER.init([OneShotTimer::new(timg0.timer0.into())]),
     );
 
     esp_println::logger::init_logger_from_env();
     log::info!("Hello world!");
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
     let sclk = io.pins.gpio18;
     let miso = io.pins.gpio20;
     let mosi = io.pins.gpio19;
-    let cs = io.pins.gpio9;
+    let cs = Output::new(io.pins.gpio9, Level::Low);;
 
     let dma = Dma::new(peripherals.DMA);
     let dma_channel = dma.channel0;
@@ -54,16 +64,11 @@ async fn main(_spawner: Spawner) {
         .with_sck(sclk)
         .with_miso(miso)
         .with_mosi(mosi)
-        .with_dma(dma_channel.configure(
-            false,
-            &mut descriptors,
-            &mut rx_descriptors,
-            DmaPriority::Priority0,
-        ));
+        .with_dma(dma_channel.configure_for_async(false, DmaPriority::Priority0), descriptors, rx_descriptors);
 
     let spi = FlashSafeDma::<_, 512>::new(spi);
 
-    let spid = ExclusiveDevice::new(spi, cs.into_push_pull_output(), embassy_time::Delay);
+    let spid = ExclusiveDevice::new(spi, cs, embassy_time::Delay).unwrap();
     let mut sd = SdSpi::<_, _, aligned::A1>::new(spid, embassy_time::Delay);
 
     loop {
