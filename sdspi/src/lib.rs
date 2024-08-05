@@ -31,6 +31,7 @@ pub const DATA_RES_MASK: u8 = 0x1F;
 pub const DATA_RES_ACCEPTED: u8 = 0x05;
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 /// SD Card
 pub struct Card {
     /// The type of this card
