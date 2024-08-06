@@ -6,7 +6,9 @@ use aligned::Aligned;
 use core::fmt::Debug;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::panic;
 use embassy_futures::select::{select, Either};
+use embedded_hal_async::spi::Operation;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
@@ -54,6 +56,8 @@ impl Card {
     }
 }
 
+const crcBufSize: usize = 1024;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -65,7 +69,7 @@ pub enum Error {
     Cmd58Error,
     Cmd59Error,
     RegisterError(u8),
-    CrcMismatch(u16, u16),
+    CrcMismatch(u16, u16, [u8; crcBufSize], [u8; 2]),
     NotInitialized,
     WriteError,
 }
@@ -294,21 +298,53 @@ where
             return Err(Error::RegisterError(r));
         }
 
-        buffer.fill(0xFF);
+        // zamiast transfer to transaction a w srodku transaction transfer
+        // jedno transaction
+
+        // See also: [`SpiDevice::transaction`], [`SpiBus::transfer_in_place`]
+        /*
+        #[inline]
+        async fn transfer_in_place(&mut self, buf: &mut [Word]) -> Result<(), Self::Error> {
+            self.transaction(&mut [Operation::TransferInPlace(buf)])
+                .await
+        }
+        */
+        /*
         self.spi
             .transfer_in_place(buffer)
             .await
             .map_err(|_| Error::SpiError)?;
-
-        let mut crc_bytes = [0xFF; 2];
+         */
+        /*
+            self.spi
+           .transfer_in_place(&mut crc_bytes)
+           .await
+           .map_err(|_| Error::SpiError)?;
+        */
+        
+        buffer.fill(0xFF);
+        let mut crc_bytes: [u8; 2] = [0xFF; 2];
         self.spi
-            .transfer_in_place(&mut crc_bytes)
+            .transaction(&mut [
+                Operation::TransferInPlace(buffer),
+                Operation::TransferInPlace(&mut crc_bytes),
+            ])
             .await
-            .map_err(|_| Error::SpiError)?;
+            .unwrap();
+
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
-            return Err(Error::CrcMismatch(crc, calc_crc));
+            //error!("crc bytes: {:?}", crc_bytes);
+            //error!("buffer bytes: {:?}", buffer);
+            let mut newBufStatic: [u8; crcBufSize] = [0; crcBufSize];
+            for aaa in buffer.iter().enumerate() {
+                if aaa.0 >= crcBufSize {
+                    break;
+                }
+                newBufStatic[aaa.0] = *aaa.1;
+            }
+            return Err(Error::CrcMismatch(crc, calc_crc, newBufStatic, crc_bytes));
         }
 
         Ok(())
