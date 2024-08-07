@@ -56,8 +56,6 @@ impl Card {
     }
 }
 
-const crcBufSize: usize = 1024;
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -69,7 +67,7 @@ pub enum Error {
     Cmd58Error,
     Cmd59Error,
     RegisterError(u8),
-    CrcMismatch(u16, u16, [u8; crcBufSize], [u8; 2]),
+    CrcMismatch(u16, u16),
     NotInitialized,
     WriteError,
 }
@@ -312,14 +310,7 @@ where
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
-            let mut newBufStatic: [u8; crcBufSize] = [0; crcBufSize];
-            for aaa in buffer.iter().enumerate() {
-                if aaa.0 >= crcBufSize {
-                    break;
-                }
-                newBufStatic[aaa.0] = *aaa.1;
-            }
-            return Err(Error::CrcMismatch(crc, calc_crc, newBufStatic, crc_bytes));
+            return Err(Error::CrcMismatch(crc, calc_crc));
         }
 
         Ok(())
