@@ -127,6 +127,7 @@ impl BiosParameterBlock {
     }
 
     fn validate_bytes_per_sector<E: IoError>(&self) -> Result<(), Error<E>> {
+        info!("self: {:?}", self);
         if self.bytes_per_sector.count_ones() != 1 {
             error!(
                 "invalid bytes_per_sector value in BPB: expected a power of two but got {}",
@@ -428,6 +429,8 @@ impl BootSector {
         let mut boot = Self::default();
         rdr.read_exact(&mut boot.bootjmp).await?;
         rdr.read_exact(&mut boot.oem_name).await?;
+        info!("BootSector: {:?}", boot);
+        info!("oem_name: {=[u8]:a}", boot.oem_name);
         boot.bpb = BiosParameterBlock::deserialize(rdr).await?;
 
         if boot.bpb.is_fat32() {
