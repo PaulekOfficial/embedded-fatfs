@@ -298,45 +298,20 @@ where
             return Err(Error::RegisterError(r));
         }
 
-        // zamiast transfer to transaction a w srodku transaction transfer
-        // jedno transaction
-
-        // See also: [`SpiDevice::transaction`], [`SpiBus::transfer_in_place`]
-        /*
-        #[inline]
-        async fn transfer_in_place(&mut self, buf: &mut [Word]) -> Result<(), Self::Error> {
-            self.transaction(&mut [Operation::TransferInPlace(buf)])
-                .await
-        }
-        */
-        /*
+        buffer.fill(0xFF);
         self.spi
             .transfer_in_place(buffer)
             .await
             .map_err(|_| Error::SpiError)?;
-         */
-        /*
-            self.spi
-           .transfer_in_place(&mut crc_bytes)
-           .await
-           .map_err(|_| Error::SpiError)?;
-        */
-        
-        buffer.fill(0xFF);
-        let mut crc_bytes: [u8; 2] = [0xFF; 2];
-        self.spi
-            .transaction(&mut [
-                Operation::TransferInPlace(buffer),
-                Operation::TransferInPlace(&mut crc_bytes),
-            ])
-            .await
-            .unwrap();
 
+        let mut crc_bytes = [0xFF; 2];
+        self.spi
+            .transfer_in_place(&mut crc_bytes)
+            .await
+            .map_err(|_| Error::SpiError)?;
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
-            //error!("crc bytes: {:?}", crc_bytes);
-            //error!("buffer bytes: {:?}", buffer);
             let mut newBufStatic: [u8; crcBufSize] = [0; crcBufSize];
             for aaa in buffer.iter().enumerate() {
                 if aaa.0 >= crcBufSize {
