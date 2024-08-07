@@ -23,6 +23,12 @@ This repository contains various crates useful interacting with FAT filesystems 
 
 Examples that can be run on your host machine are found in each crates `examples` folder. For full embedded examples, see the `examples` directory at the root of the repository.
 
+## Prepare the SD card
+To make the SD card work with this library, you need to skip creating the partition table, the whole sd card needs to be fat32, so basically 
+```
+mkfs.fat -F 32 /dev/the_whole_sd_card
+```
+
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the
