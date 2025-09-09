@@ -72,6 +72,18 @@ pub enum Error {
     WriteError,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+/// High-level view of the card state in SPI mode
+pub enum CardState {
+    /// Card is in the ready/transfer state and can accept commands
+    Ready,
+    /// Card is in the idle state (often used as a low-power/sleep equivalent in SPI mode)
+    Idle,
+    /// Card reports another state or an error via the R1 status byte
+    Error(u8),
+}
+
 /// Must be called between powerup and [SdSpi::init] to ensure the sdcard is properly initialized.
 pub async fn sd_init<SPI, CS, BE>(spi: &mut SPI, cs: &mut CS) -> Result<(), Error>
 where
@@ -408,6 +420,62 @@ where
             .map_err(|_| Error::SpiError)?;
 
         Ok(buf[0])
+    }
+
+    /// Put the card into idle state (CMD0 / GO_IDLE_STATE). Useful to re-initialize or low-power fallback.
+    pub async fn enter_idle_state(&mut self) -> Result<(), Error> {
+        // CMD0 may be sent without waiting for idle clock cycles; we still respect wait_idle for consistency
+        let r1 = self.cmd(idle()).await?;
+        if r1 & R1_IDLE_STATE != R1_IDLE_STATE {
+            return Err(Error::RegisterError(r1));
+        }
+        Ok(())
+    }
+
+    /// Hint the card to enter sleep by stopping any ongoing transmission and releasing the bus.
+    /// In SPI mode there is no dedicated SLEEP/AWAKE (CMD5 is SDIO). Practical low-power sequence is:
+    /// - Ensure no data in flight
+    /// - Send GO_IDLE_STATE if you want the card to enter idle
+    /// - Then stop providing SPI clock and deassert CS at the platform level
+    pub async fn sleep(&mut self) -> Result<(), Error> {
+        // Wait for the card to be idle on the data line
+        self.wait_idle().await?;
+        // Put card into idle state to minimize power
+        self.enter_idle_state().await?;
+        Ok(())
+    }
+
+    /// Wake the card by providing 74+ clock cycles with CS deasserted, then re-run init() sequence.
+    /// The user must have called sd_init(spi, cs) externally after power-up; here we only wake using clocks.
+    /// For convenience, this just waits a bit so upper layers can provide clocks, then returns.
+    pub async fn wake_hint(&mut self) -> Result<(), Error> {
+        // Nothing to do at SPI transaction level; higher level must toggle CS high and provide clocks.
+        // We insert a small delay to allow host to clock out dummy bytes.
+        self.delay.delay_ms(1).await;
+        Ok(())
+    }
+
+    /// Query the card for its current state in SPI mode using CMD13 (sd_status).
+    /// Returns Ready when the R1 status is 0x00, Idle when R1 indicates the idle bit,
+    /// otherwise Error(r1). In SPI mode, "sleeping" typically corresponds to Idle.
+    pub async fn get_state(&mut self) -> Result<CardState, Error> {
+        // CMD13 in SPI returns an R2 response: first byte is R1 status, second is extra status.
+        let r1 = self.cmd(sd_status()).await?;
+        // Read and discard the second status byte to keep the bus aligned for next ops.
+        let _r2_extra = self.read_byte().await?;
+
+        if r1 == R1_READY_STATE {
+            Ok(CardState::Ready)
+        } else if (r1 & R1_IDLE_STATE) != 0 {
+            Ok(CardState::Idle)
+        } else {
+            Ok(CardState::Error(r1))
+        }
+    }
+
+    /// Convenience helper to check if the card is currently in the idle (sleep-like) state.
+    pub async fn is_idle(&mut self) -> Result<bool, Error> {
+        Ok(matches!(self.get_state().await?, CardState::Idle))
     }
 }
 
