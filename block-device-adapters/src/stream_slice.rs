@@ -25,12 +25,24 @@ pub struct StreamSlice<T: Read + Write + Seek> {
     size: u64,
 }
 
-impl<E: Debug> embedded_io_async::Error for StreamSliceError<E> {
-    fn kind(&self) -> embedded_io_async::ErrorKind {
+impl<E: Debug> core::fmt::Display for StreamSliceError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            StreamSliceError::InvalidSeek(_) => embedded_io_async::ErrorKind::InvalidInput,
+            StreamSliceError::InvalidSeek(o) => write!(f, "Invalid seek: {}", o),
+            StreamSliceError::WriteZero => write!(f, "Write zero"),
+            StreamSliceError::Other(e) => write!(f, "Other error: {:?}", e),
+        }
+    }
+}
+
+impl<E: Debug> core::error::Error for StreamSliceError<E> {}
+
+impl<E: Debug> embedded_io::Error for StreamSliceError<E> {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        match self {
+            StreamSliceError::InvalidSeek(_) => embedded_io::ErrorKind::InvalidInput,
             StreamSliceError::Other(_) | StreamSliceError::WriteZero => {
-                embedded_io_async::ErrorKind::Other
+                embedded_io::ErrorKind::Other
             }
         }
     }

@@ -970,14 +970,22 @@ mod tests {
         #[derive(Debug)]
         struct Dummy;
 
-        impl embedded_io_async::ErrorType for Dummy {
-            type Error = Self;
+        impl core::fmt::Display for Dummy {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "Dummy")
+            }
         }
 
-        impl embedded_io_async::Error for Dummy {
-            fn kind(&self) -> embedded_io_async::ErrorKind {
-                embedded_io_async::ErrorKind::TimedOut
+        impl core::error::Error for Dummy {}
+
+        impl embedded_io::Error for Dummy {
+            fn kind(&self) -> embedded_io::ErrorKind {
+                embedded_io::ErrorKind::TimedOut
             }
+        }
+
+        impl embedded_io_async::ErrorType for Dummy {
+            type Error = Self;
         }
 
         let bytes_per_sector = 512_u16;

@@ -13,17 +13,18 @@ Block device adapters for managing byte level access and partitions
 
 [dependencies]
 aligned = "0.4.2"
-embedded-io-async = "0.6.1"
+embedded-io = "0.7.0"
+embedded-io-async = "0.7.0"
 block-device-driver = { version = "0.2", path = "../block-device-driver" }
 
 log = { version = "0.4", optional = true }
-defmt = { version = "0.3", optional = true }
+defmt = { version = "1.0.1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11.5"
 tokio = { version = "1", default-features = false, features = ["fs", "rt-multi-thread", "macros", "io-util"] }
 anyhow = "1"
-embedded-io-adapters = { version = "0.6", package = "embedded-io-adapters", features = ["tokio-1"] }
+embedded-io-adapters = { version = "0.7.0", package = "embedded-io-adapters", features = ["tokio-1"] }
 
 [features]
 log = ["dep:log"]

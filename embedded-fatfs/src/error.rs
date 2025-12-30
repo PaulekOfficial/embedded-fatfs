@@ -1,5 +1,6 @@
-use core::fmt::Debug;
-pub(crate) use embedded_io_async::{Error as IoError, ErrorKind, ReadExactError};
+use core::fmt::{Debug, Display};
+pub(crate) use embedded_io_async::{ErrorKind, ReadExactError};
+pub use embedded_io_async::Error as IoError;
 
 /// Error enum with all errors that can be returned by functions from this crate
 ///
@@ -32,9 +33,21 @@ pub enum Error<T> {
     UnsupportedFileNameCharacter,
 }
 
-impl<T: Debug> IoError for Error<T> {
+impl<T: Debug + Display> embedded_io::Error for Error<T> {
     fn kind(&self) -> ErrorKind {
-        ErrorKind::Other
+        match self {
+            Error::Io(_) => ErrorKind::Other,
+            Error::UnexpectedEof => ErrorKind::Other,
+            Error::WriteZero => ErrorKind::WriteZero,
+            Error::InvalidInput => ErrorKind::InvalidInput,
+            Error::NotFound => ErrorKind::NotFound,
+            Error::AlreadyExists => ErrorKind::AlreadyExists,
+            Error::DirectoryIsNotEmpty => ErrorKind::Other,
+            Error::CorruptedFileSystem => ErrorKind::Other,
+            Error::NotEnoughSpace => ErrorKind::OutOfMemory,
+            Error::InvalidFileNameLength => ErrorKind::InvalidInput,
+            Error::UnsupportedFileNameCharacter => ErrorKind::InvalidInput,
+        }
     }
 }
 
@@ -62,7 +75,7 @@ impl<T: IoError> From<ReadExactError<T>> for Error<T> {
     }
 }
 
-impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
+impl<T: Display> Display for Error<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Io(io_error) => write!(f, "IO error: {}", io_error),
@@ -80,13 +93,4 @@ impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
     }
 }
 
-#[cfg(feature = "std")]
-impl<T: std::error::Error + 'static> std::error::Error for Error<T> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        if let Error::Io(io_error) = self {
-            Some(io_error)
-        } else {
-            None
-        }
-    }
-}
+impl<T: Debug + Display> core::error::Error for Error<T> {}

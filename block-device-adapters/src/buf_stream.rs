@@ -1,6 +1,6 @@
 use aligned::Aligned;
 use block_device_driver::{slice_to_blocks, slice_to_blocks_mut, BlockDevice};
-use embedded_io_async::{ErrorKind, Read, Seek, SeekFrom, Write};
+use embedded_io_async::{Read, Seek, SeekFrom, Write};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -15,9 +15,19 @@ impl<T> From<T> for BufStreamError<T> {
     }
 }
 
-impl<T: core::fmt::Debug> embedded_io_async::Error for BufStreamError<T> {
-    fn kind(&self) -> ErrorKind {
-        ErrorKind::Other
+impl<T: core::fmt::Debug> core::fmt::Display for BufStreamError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BufStreamError::Io(e) => write!(f, "IO error: {:?}", e),
+        }
+    }
+}
+
+impl<T: core::fmt::Debug> core::error::Error for BufStreamError<T> {}
+
+impl<T: core::fmt::Debug> embedded_io::Error for BufStreamError<T> {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        embedded_io::ErrorKind::Other
     }
 }
 
@@ -256,6 +266,10 @@ mod tests {
     impl<T: Read + Write + Seek> Write for TestBlockDevice<T> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             Ok(self.0.write(buf).await?)
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(self.0.flush().await?)
         }
     }
 

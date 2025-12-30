@@ -72,6 +72,27 @@ pub enum Error {
     WriteError,
 }
 
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::ChipSelect => write!(f, "ChipSelect error"),
+            Error::SpiError => write!(f, "SPI error"),
+            Error::Timeout => write!(f, "Timeout"),
+            Error::UnsupportedCard => write!(f, "Unsupported card"),
+            Error::Cmd58Error => write!(f, "CMD58 error"),
+            Error::Cmd59Error => write!(f, "CMD59 error"),
+            Error::RegisterError(r) => write!(f, "Register error: {}", r),
+            Error::CrcMismatch(expected, actual) => {
+                write!(f, "CRC mismatch: expected {}, actual {}", expected, actual)
+            }
+            Error::NotInitialized => write!(f, "Not initialized"),
+            Error::WriteError => write!(f, "Write error"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 /// High-level view of the card state in SPI mode
