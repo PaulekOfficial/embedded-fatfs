@@ -3,12 +3,9 @@
 #![no_std]
 
 use aligned::Aligned;
-use core::fmt::Debug;
 use core::future::Future;
 use core::marker::PhantomData;
-use core::panic;
 use embassy_futures::select::{select, Either};
-use embedded_hal_async::spi::Operation;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
@@ -118,27 +115,31 @@ where
     Ok(())
 }
 
-pub struct SdSpi<SPI, D, ALIGN>
+pub struct SdSpi<SPI, CS, D, ALIGN>
 where
-    SPI: embedded_hal_async::spi::SpiDevice,
+    SPI: embedded_hal_async::spi::SpiBus,
+    CS: embedded_hal::digital::OutputPin,
     D: embedded_hal_async::delay::DelayNs,
     ALIGN: aligned::Alignment,
 {
     spi: SPI,
+    cs: CS,
     delay: D,
     card: Option<Card>,
     _align: PhantomData<ALIGN>,
 }
 
-impl<SPI, D, ALIGN> SdSpi<SPI, D, ALIGN>
+impl<SPI, CS, D, ALIGN> SdSpi<SPI, CS, D, ALIGN>
 where
-    SPI: embedded_hal_async::spi::SpiDevice,
+    SPI: embedded_hal_async::spi::SpiBus,
+    CS: embedded_hal::digital::OutputPin,
     D: embedded_hal_async::delay::DelayNs + Clone,
     ALIGN: aligned::Alignment,
 {
-    pub fn new(spi: SPI, delay: D) -> Self {
+    pub fn new(spi: SPI, cs: CS, delay: D) -> Self {
         Self {
             spi,
+            cs,
             delay,
             card: None,
             _align: PhantomData,
@@ -147,105 +148,102 @@ where
 
     /// To comply with the SD card spec, [sd_init] must be called between powerup and calling this function.
     pub async fn init(&mut self) -> Result<(), Error> {
-        let r = async {
-            with_timeout(self.delay.clone(), 1000, async {
-                loop {
-                    let r = self.cmd(idle()).await?;
-                    if r == R1_IDLE_STATE {
-                        return Ok(());
-                    }
+        with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let r = self.cmd(idle()).await?;
+                if r == R1_IDLE_STATE {
+                    return Ok(());
                 }
-            })
-            .await??;
-
-            // "The SPI interface is initialized in the CRC OFF mode in default"
-            // -- SD Part 1 Physical Layer Specification v9.00, Section 7.2.2 Bus Transfer Protection
-            if self.cmd(cmd::<R1>(0x3B, 1)).await? != R1_IDLE_STATE {
-                return Err(Error::Cmd59Error);
             }
+        })
+        .await??;
 
-            with_timeout(self.delay.clone(), 1000, async {
-                loop {
-                    let r = self.cmd(send_if_cond(0x1, 0xAA)).await?;
-                    if r == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
-                        return Err(Error::UnsupportedCard);
-                    }
-                    let mut buffer = [0xFFu8; 4];
-                    self.spi
-                        .transfer_in_place(&mut buffer[..])
-                        .await
-                        .map_err(|_| Error::SpiError)?;
-                    if buffer[3] == 0xAA {
-                        return Ok(());
-                    }
-                }
-            })
-            .await??;
-
-            trace!("Valid card detected!");
-
-            // If we get here we're at least a v2 card
-            let mut card = Card::default();
-
-            // send ACMD41
-            with_timeout(self.delay.clone(), 1000, async {
-                loop {
-                    let r = self.acmd(sd_send_op_cond(true, false, true, 0x20)).await?;
-                    if r == R1_READY_STATE {
-                        return Ok(());
-                    }
-                }
-            })
-            .await??;
-
-            trace!("send_ocr");
-            card.ocr = with_timeout(self.delay.clone(), 1000, async {
-                loop {
-                    let r = self.cmd(cmd::<R3>(0x3A, 0)).await?;
-                    if r != R1_READY_STATE {
-                        return Err(Error::Cmd58Error);
-                    }
-                    let mut buffer = [0xFFu8; 4];
-                    self.spi
-                        .transfer_in_place(&mut buffer[..])
-                        .await
-                        .map_err(|_| Error::SpiError)?;
-                    let ocr: OCR<SD> = u32::from_be_bytes(buffer).into();
-                    if !ocr.is_busy() {
-                        return Ok(ocr);
-                    }
-                }
-            })
-            .await??;
-
-            trace!("send_csd");
-            let r = self.cmd(send_csd(card.rca as u16)).await?;
-            if r != R1_READY_STATE {
-                return Err(Error::RegisterError(r));
-            }
-            let mut csd = [0xFFu8; 16];
-            self.read_data(&mut csd).await?;
-            card.csd = u128::from_be_bytes(csd).into();
-
-            trace!("all_send_cid");
-            let r = self.cmd(send_cid(card.rca as u16)).await?;
-            if r != R1_READY_STATE {
-                return Err(Error::RegisterError(r));
-            }
-            let mut cid = [0xFFu8; 16];
-            self.read_data(&mut cid).await?;
-            card.cid = u128::from_be_bytes(cid).into();
-
-            trace!("Card initialized: {:?}", card);
-            debug!("Found card with size: {}bytes", card.size());
-
-            self.card = Some(card);
-
-            Ok(())
+        // "The SPI interface is initialized in the CRC OFF mode in default"
+        // -- SD Part 1 Physical Layer Specification v9.00, Section 7.2.2 Bus Transfer Protection
+        if self.cmd(cmd::<R1>(0x3B, 1)).await? != R1_IDLE_STATE {
+            return Err(Error::Cmd59Error);
         }
-        .await;
 
-        r
+        with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let (r, ext) = self.cmd_ext(send_if_cond(0x1, 0xAA)).await?;
+                if r == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
+                    return Err(Error::UnsupportedCard);
+                }
+                if ext[3] == 0xAA {
+                    return Ok(());
+                }
+            }
+        })
+        .await??;
+
+        trace!("Valid card detected!");
+
+        // If we get here we're at least a v2 card
+        let mut card = Card::default();
+
+        // send ACMD41
+        with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let r = self.acmd(sd_send_op_cond(true, false, true, 0x20)).await?;
+                if r == R1_READY_STATE {
+                    return Ok(());
+                }
+            }
+        })
+        .await??;
+
+        trace!("send_ocr");
+        card.ocr = with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let (r, ext) = self.cmd_ext(cmd::<R3>(0x3A, 0)).await?;
+                if r != R1_READY_STATE {
+                    return Err(Error::Cmd58Error);
+                }
+                let ocr: OCR<SD> = u32::from_be_bytes(ext).into();
+                if !ocr.is_busy() {
+                    return Ok(ocr);
+                }
+            }
+        })
+        .await??;
+
+        trace!("send_csd");
+        let mut csd = [0xFFu8; 16];
+        {
+            self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+            let r1 = self.cmd_raw(send_csd(card.rca as u16)).await;
+            let r2 = match r1 {
+                Ok(r) if r == R1_READY_STATE => self.read_data_raw(&mut csd).await,
+                Ok(r) => Err(Error::RegisterError(r)),
+                Err(e) => Err(e),
+            };
+            self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+            r2?;
+        }
+        card.csd = u128::from_be_bytes(csd).into();
+
+        trace!("all_send_cid");
+        let mut cid = [0xFFu8; 16];
+        {
+            self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+            let r1 = self.cmd_raw(send_cid(card.rca as u16)).await;
+            let r2 = match r1 {
+                Ok(r) if r == R1_READY_STATE => self.read_data_raw(&mut cid).await,
+                Ok(r) => Err(Error::RegisterError(r)),
+                Err(e) => Err(e),
+            };
+            self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+            r2?;
+        }
+        card.cid = u128::from_be_bytes(cid).into();
+
+        trace!("Card initialized: {:?}", card);
+        debug!("Found card with size: {}bytes", card.size());
+
+        self.card = Some(card);
+
+        Ok(())
     }
 
     pub async fn read<const SIZE: usize>(
@@ -253,24 +251,36 @@ where
         block_address: u32,
         data: &mut [Aligned<ALIGN, [u8; SIZE]>],
     ) -> Result<(), Error> {
-        let r = async {
-            if data.len() == 1 {
-                self.cmd(read_single_block(block_address)).await?;
-                self.read_data(&mut data[0][..]).await?;
-            } else {
-                self.cmd(read_multiple_blocks(block_address)).await?;
-                for block in data {
-                    self.read_data(&mut block[..]).await?;
-                }
-                self.cmd(stop_transmission()).await?;
+        self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+        let result = if data.len() == 1 {
+            let r1 = self.cmd_raw(read_single_block(block_address)).await;
+            match r1 {
+                Err(e) => Err(e),
+                Ok(r) if r != R1_READY_STATE => Err(Error::RegisterError(r)),
+                Ok(_) => self.read_data_raw(&mut data[0][..]).await,
             }
-            Ok(())
-        }
-        .await;
-
-        r?;
-
-        Ok(())
+        } else {
+            let r1 = self.cmd_raw(read_multiple_blocks(block_address)).await;
+            let r = match r1 {
+                Err(e) => Err(e),
+                Ok(r) if r != R1_READY_STATE => Err(Error::RegisterError(r)),
+                Ok(_) => {
+                    let mut result = Ok(());
+                    for block in data.iter_mut() {
+                        result = self.read_data_raw(&mut block[..]).await;
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    result
+                }
+            };
+            // Stop transfer (CMD12) while CS is still LOW — spec-correct
+            let _ = self.cmd_raw(stop_transmission()).await;
+            r
+        };
+        self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+        result
     }
 
     pub async fn write<const SIZE: usize>(
@@ -278,72 +288,149 @@ where
         block_address: u32,
         data: &[Aligned<ALIGN, [u8; SIZE]>],
     ) -> Result<(), Error> {
-        let r = async {
-            if data.len() == 1 {
-                self.cmd(write_single_block(block_address)).await?;
-                self.write_data(DATA_START_BLOCK, &data[0][..]).await?;
-                self.wait_idle().await?;
-                // check status, in SD SPI mode, the status is two bytes
-                if self.cmd(sd_status()).await? != 0 {
-                    return Err(Error::WriteError);
+        if data.len() == 1 {
+            self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+            let result = {
+                let r1 = self.cmd_raw(write_single_block(block_address)).await;
+                match r1 {
+                    Err(e) => Err(e),
+                    Ok(r) if r != R1_READY_STATE => Err(Error::RegisterError(r)),
+                    Ok(_) => {
+                        let r = self.write_data_raw(DATA_START_BLOCK, &data[0][..]).await;
+                        match r {
+                            Err(e) => Err(e),
+                            Ok(_) => {
+                                let r = self.wait_idle_raw().await;
+                                match r {
+                                    Err(e) => Err(e),
+                                    Ok(_) => {
+                                        // check status, in SD SPI mode, the status is two bytes
+                                        let cmd_status = match self.cmd_raw(sd_status()).await {
+                                            Ok(r) => r,
+                                            Err(_) => {
+                                                trace!("Failed to read SD status after write");
+                                                return Err(Error::WriteError);
+                                            }
+                                        };
+                                        let _r2 = self.read_byte_raw().await?; // consume R2 second byte
+                                        trace!("SD status after write: {}", cmd_status);
+                                        if cmd_status != 0 {
+                                            Err(Error::WriteError)
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                if self.read_byte().await? != 0 {
-                    return Err(Error::WriteError);
-                }
-            } else {
+            };
+            self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+            result
+        } else {
+            self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+            let result = {
                 // Try sending ACMD23 _before_ write.
                 // This will pre-erase blocks to improve write performance.
-                // We ignore the return value, because whether its accepted
-                // or not doesn't matter we will still proceed with the write
-                self.acmd(cmd::<R1>(0x17, data.len() as u32)).await?;
-                self.wait_idle().await?;
+                // Ignore errors — whether accepted or not, we proceed with the write.
+                let _ = self.cmd_raw(app_cmd(self.card.map(|c| c.rca).unwrap_or(0) as u16)).await;
+                let _ = self.cmd_raw(cmd::<R1>(0x17, data.len() as u32)).await;
 
-                self.cmd(write_multiple_blocks(block_address)).await?;
-                for block in data {
-                    self.wait_idle().await?;
-                    self.write_data(WRITE_MULTIPLE_TOKEN, &block[..]).await?;
+                let r1 = self.cmd_raw(write_multiple_blocks(block_address)).await;
+                match r1 {
+                    Err(e) => Err(e),
+                    Ok(r) if r != R1_READY_STATE => Err(Error::RegisterError(r)),
+                    Ok(_) => {
+                        let mut write_err: Option<Error> = None;
+                        for block in data {
+                            let r = self.wait_idle_raw().await;
+                            if let Err(e) = r {
+                                write_err = Some(e);
+                                break;
+                            }
+                            let r = self.write_data_raw(WRITE_MULTIPLE_TOKEN, &block[..]).await;
+                            if let Err(e) = r {
+                                write_err = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = write_err {
+                            return Err(e);
+                        }
+
+                        // STOP_TRAN_TOKEN + mandatory stuff byte
+                        let r = self.wait_idle_raw().await;
+                        if let Err(e) = r { return Err(e); }
+                        let r = self.spi.write(&[STOP_TRAN_TOKEN]).await.map_err(|_| Error::SpiError);
+                        if let Err(e) = r { return Err(e); }
+                        let mut stuff = [0xFFu8; 1];
+                        let r = self.spi.transfer_in_place(&mut stuff).await.map_err(|_| Error::SpiError);
+                        if let Err(e) = r { return Err(e); }
+
+                        // Wait for all blocks to finish programming
+                        self.wait_idle_raw().await
+                    }
                 }
-                // stop the write
-                self.wait_idle().await?;
-                self.spi
-                    .write(&[STOP_TRAN_TOKEN])
-                    .await
-                    .map_err(|_| Error::SpiError)?;
-            }
-            Ok(())
+            };
+            self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+            result
         }
-        .await;
-
-        r?;
-
-        Ok(())
     }
 
     pub async fn size(&mut self) -> Result<u64, Error> {
         Ok(self.card.ok_or(Error::NotInitialized)?.size())
     }
 
-    async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        let r = with_timeout(self.delay.clone(), 1000, async {
-            let mut byte = 0xFF;
-            while byte == 0xFF {
-                byte = self.read_byte().await?;
+    /// Returns a mutable reference to the underlying SpiBus.
+    pub fn spi(&mut self) -> &mut SPI {
+        &mut self.spi
+    }
+
+    // ── Raw primitives (CS managed by caller) ──────────────────────────────
+
+    async fn read_byte_raw(&mut self) -> Result<u8, Error> {
+        let mut buf = [0xFFu8; 1];
+        self.spi
+            .transfer_in_place(&mut buf)
+            .await
+            .map_err(|_| Error::SpiError)?;
+        Ok(buf[0])
+    }
+
+    async fn wait_idle_raw(&mut self) -> Result<(), Error> {
+        with_timeout(self.delay.clone(), 5000, async {
+            while self.read_byte_raw().await? != 0xFF {}
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn read_data_raw(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
+        // Poll for start token — CS already LOW, no CS toggles
+        let token = with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let b = self.read_byte_raw().await?;
+                if b != 0xFF {
+                    return Ok(b);
+                }
             }
-            Ok(byte)
         })
         .await??;
 
-        if r != DATA_START_BLOCK {
-            return Err(Error::RegisterError(r));
+        if token != DATA_START_BLOCK {
+            return Err(Error::RegisterError(token));
         }
 
+        // Bulk read via transfer_in_place (sends 0xFF, receives data)
         buffer.fill(0xFF);
         self.spi
             .transfer_in_place(buffer)
             .await
             .map_err(|_| Error::SpiError)?;
 
-        let mut crc_bytes = [0xFF; 2];
+        // Read 2 CRC bytes
+        let mut crc_bytes = [0xFFu8; 2];
         self.spi
             .transfer_in_place(&mut crc_bytes)
             .await
@@ -357,19 +444,28 @@ where
         Ok(())
     }
 
-    async fn write_data(&mut self, token: u8, buffer: &[u8]) -> Result<(), Error> {
+    async fn write_data_raw(&mut self, token: u8, buffer: &[u8]) -> Result<(), Error> {
+        let crc = crc16(buffer).to_be_bytes();
+
+        // Write token + data + CRC (CS already LOW from caller)
         self.spi
             .write(&[token])
             .await
             .map_err(|_| Error::SpiError)?;
         self.spi.write(buffer).await.map_err(|_| Error::SpiError)?;
-        let crc_bytes = crc16(buffer).to_be_bytes();
-        self.spi
-            .write(&crc_bytes)
-            .await
-            .map_err(|_| Error::SpiError)?;
+        self.spi.write(&crc).await.map_err(|_| Error::SpiError)?;
 
-        let status = self.read_byte().await?;
+        // Read data response token — still within the SAME CS-LOW window
+        let status = with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let b = self.read_byte_raw().await?;
+                if b != 0xFF {
+                    return Ok(b);
+                }
+            }
+        })
+        .await??;
+
         if (status & DATA_RES_MASK) != DATA_RES_ACCEPTED {
             return Err(Error::WriteError);
         }
@@ -377,21 +473,17 @@ where
         Ok(())
     }
 
-    pub fn spi(&mut self) -> &mut SPI {
-        &mut self.spi
-    }
-
-    async fn cmd<R: Resp>(&mut self, cmd: Cmd<R>) -> Result<u8, Error> {
-        if cmd.cmd != idle().cmd {
-            self.wait_idle().await?;
+    async fn cmd_raw<R: Resp>(&mut self, command: Cmd<R>) -> Result<u8, Error> {
+        if command.cmd != idle().cmd {
+            self.wait_idle_raw().await?;
         }
 
         let mut buf = [
-            0x40 | cmd.cmd,
-            (cmd.arg >> 24) as u8,
-            (cmd.arg >> 16) as u8,
-            (cmd.arg >> 8) as u8,
-            cmd.arg as u8,
+            0x40 | command.cmd,
+            (command.arg >> 24) as u8,
+            (command.arg >> 16) as u8,
+            (command.arg >> 8) as u8,
+            command.arg as u8,
             0,
         ];
         buf[5] = crc7(&buf[0..5]);
@@ -399,16 +491,18 @@ where
         self.spi.write(&buf).await.map_err(|_| Error::SpiError)?;
 
         // skip stuff byte for stop read
-        if cmd.cmd == stop_transmission().cmd {
+        if command.cmd == stop_transmission().cmd {
+            let mut stuff = [0xFFu8; 1];
             self.spi
-                .transfer_in_place(&mut [0xFF])
+                .transfer_in_place(&mut stuff)
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
 
+        // Poll for R1 (first byte with MSB = 0)
         let byte = with_timeout(self.delay.clone(), 1000, async {
             loop {
-                let byte = self.read_byte().await?;
+                let byte = self.read_byte_raw().await?;
                 if byte & 0x80 == 0 {
                     return Ok(byte);
                 }
@@ -419,33 +513,48 @@ where
         Ok(byte)
     }
 
-    async fn acmd<R: Resp>(&mut self, cmd: Cmd<R>) -> Result<u8, Error> {
-        self.cmd(app_cmd(self.card.map(|c| c.rca).unwrap_or(0) as u16))
-            .await?;
-        self.cmd(cmd).await
-    }
-
-    async fn wait_idle(&mut self) -> Result<(), Error> {
-        with_timeout(self.delay.clone(), 5000, async {
-            while self.read_byte().await? != 0xFF {}
-            Ok(())
-        })
-        .await?
-    }
-
-    async fn read_byte(&mut self) -> Result<u8, Error> {
-        let mut buf = [0xFFu8; 1];
+    /// Like `cmd_raw` but also reads 4 extension bytes atomically (for R3/R7 responses).
+    async fn cmd_raw_ext<R: Resp>(&mut self, command: Cmd<R>) -> Result<(u8, [u8; 4]), Error> {
+        let r1 = self.cmd_raw(command).await?;
+        let mut ext = [0xFFu8; 4];
         self.spi
-            .transfer_in_place(&mut buf[..])
+            .transfer_in_place(&mut ext)
             .await
             .map_err(|_| Error::SpiError)?;
+        Ok((r1, ext))
+    }
 
-        Ok(buf[0])
+    // ── Managed commands (CS lifecycle handled internally) ──────────────────
+
+    async fn wait_idle(&mut self) -> Result<(), Error> {
+        self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+        let r = self.wait_idle_raw().await;
+        self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+        r
+    }
+
+    async fn cmd<R: Resp>(&mut self, command: Cmd<R>) -> Result<u8, Error> {
+        self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+        let r = self.cmd_raw(command).await;
+        self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+        r
+    }
+
+    async fn cmd_ext<R: Resp>(&mut self, command: Cmd<R>) -> Result<(u8, [u8; 4]), Error> {
+        self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+        let r = self.cmd_raw_ext(command).await;
+        self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+        r
+    }
+
+    async fn acmd<R: Resp>(&mut self, command: Cmd<R>) -> Result<u8, Error> {
+        self.cmd(app_cmd(self.card.map(|c| c.rca).unwrap_or(0) as u16))
+            .await?;
+        self.cmd(command).await
     }
 
     /// Put the card into idle state (CMD0 / GO_IDLE_STATE). Useful to re-initialize or low-power fallback.
     pub async fn enter_idle_state(&mut self) -> Result<(), Error> {
-        // CMD0 may be sent without waiting for idle clock cycles; we still respect wait_idle for consistency
         let r1 = self.cmd(idle()).await?;
         if r1 & R1_IDLE_STATE != R1_IDLE_STATE {
             return Err(Error::RegisterError(r1));
@@ -481,9 +590,19 @@ where
     /// otherwise Error(r1). In SPI mode, "sleeping" typically corresponds to Idle.
     pub async fn get_state(&mut self) -> Result<CardState, Error> {
         // CMD13 in SPI returns an R2 response: first byte is R1 status, second is extra status.
-        let r1 = self.cmd(sd_status()).await?;
-        // Read and discard the second status byte to keep the bus aligned for next ops.
-        let _r2_extra = self.read_byte().await?;
+        // Both bytes must be read within the same CS window.
+        self.cs.set_low().map_err(|_| Error::ChipSelect)?;
+        let r1 = self.cmd_raw(sd_status()).await;
+        let r2 = match r1 {
+            Ok(r1) => {
+                // Read and discard the second status byte to keep the bus aligned for next ops.
+                let _r2_extra = self.read_byte_raw().await;
+                Ok(r1)
+            }
+            Err(e) => Err(e),
+        };
+        self.cs.set_high().map_err(|_| Error::ChipSelect)?;
+        let r1 = r2?;
 
         if r1 == R1_READY_STATE {
             Ok(CardState::Ready)
@@ -500,10 +619,11 @@ where
     }
 }
 
-impl<SPI, D, ALIGN, const SIZE: usize> block_device_driver::BlockDevice<SIZE>
-    for SdSpi<SPI, D, ALIGN>
+impl<SPI, CS, D, ALIGN, const SIZE: usize> block_device_driver::BlockDevice<SIZE>
+    for SdSpi<SPI, CS, D, ALIGN>
 where
-    SPI: embedded_hal_async::spi::SpiDevice,
+    SPI: embedded_hal_async::spi::SpiBus,
+    CS: embedded_hal::digital::OutputPin,
     D: embedded_hal_async::delay::DelayNs + Clone,
     ALIGN: aligned::Alignment,
 {

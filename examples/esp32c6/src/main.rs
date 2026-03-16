@@ -6,7 +6,6 @@ use block_device_adapters::BufStreamError;
 use embassy_executor::Spawner;
 use embedded_fatfs::FsOptions;
 use embedded_hal_async::delay::DelayNs;
-use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::{Read, Seek, Write};
 use esp_backtrace as _;
 use esp_hal::{
@@ -55,7 +54,9 @@ async fn main(_spawner: Spawner) {
         .with_sck(sclk)
         .with_miso(miso)
         .with_mosi(mosi)
-        .with_dma(dma_channel.configure_for_async(false, DmaPriority::Priority0));
+        .with_dma(dma_channel)
+        .with_buffers(dma_rx_buf, dma_tx_buf)
+        .into_async();
 
     let mut spi = SpiDmaBus::new(spi, dma_tx_buf, dma_rx_buf);
 
@@ -71,16 +72,13 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    let spid = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
-    let mut sd = SdSpi::<_, _, aligned::A1>::new(spid, embassy_time::Delay);
+    let mut sd = SdSpi::<_, _, _, aligned::A1>::new(spi, cs, embassy_time::Delay);
 
     loop {
         // Initialize the card
         if sd.init().await.is_ok() {
             // Increase the speed up to the SD max of 25mhz
-            sd.spi()
-                .bus_mut()
-                .change_bus_frequency(25u32.MHz(), &clocks);
+            sd.spi().change_bus_frequency(25u32.MHz(), &clocks);
             log::info!("Initialization complete!");
 
             break;

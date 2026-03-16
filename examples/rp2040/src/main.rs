@@ -3,23 +3,18 @@
 
 use block_device_adapters::BufStream;
 use block_device_adapters::BufStreamError;
-use embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig;
+use embassy_embedded_hal::SetConfig;
 use embassy_executor::Spawner;
 use embassy_rp::{
     gpio::{Level, Output},
     peripherals::*,
     spi::{Async, Config, Spi},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embedded_fatfs::FsOptions;
 use embedded_hal_async::delay::DelayNs;
 use heapless::{String, Vec};
 use sdspi::{sd_init, SdSpi};
-use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
-
-static SPI_BUS: StaticCell<Mutex<CriticalSectionRawMutex, Spi<'static, SPI0, Async>>> =
-    StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -41,7 +36,7 @@ async fn main(_spawner: Spawner) {
         miso,
         p.DMA_CH0,
         p.DMA_CH1,
-        config.clone(),
+        config,
     );
 
     // Sd cards need to be clocked with a at least 74 cycles on their spi clock without the cs enabled,
@@ -56,19 +51,15 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    let spi_bus = SPI_BUS.init(Mutex::new(spi));
-
-    let spid = SpiDeviceWithConfig::new(spi_bus, cs, config);
-    let mut sd = SdSpi::<_, _, aligned::A1>::new(spid, embassy_time::Delay);
+    let mut sd = SdSpi::<_, _, _, aligned::A1>::new(spi, cs, embassy_time::Delay);
 
     loop {
         // Initialize the card
         if sd.init().await.is_ok() {
             // Increase the speed up to the SD max of 25mhz
-
-            let mut config = Config::default();
-            config.frequency = 25_000_000;
-            sd.spi().set_config(config);
+            let mut fast_config = Config::default();
+            fast_config.frequency = 25_000_000;
+            sd.spi().set_config(&fast_config);
             defmt::info!("Initialization complete!");
 
             break;
