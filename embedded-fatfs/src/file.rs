@@ -1,5 +1,7 @@
 use core::cmp;
 
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
+
 use crate::dir_entry::DirEntryEditor;
 use crate::error::Error;
 use crate::fs::{FileSystem, ReadWriteSeek};
@@ -11,10 +13,10 @@ const MAX_FILE_SIZE: u32 = core::u32::MAX;
 /// A FAT filesystem file object used for reading and writing data.
 ///
 /// This struct is created by the `open_file` or `create_file` methods on `Dir`.
-pub struct File<'a, IO: ReadWriteSeek, TP, OCC> {
+pub struct File<'a, IO: ReadWriteSeek, TP, OCC, M: RawMutex = NoopRawMutex> {
     context: FileContext,
     // file-system reference
-    fs: &'a FileSystem<IO, TP, OCC>,
+    fs: &'a FileSystem<IO, TP, OCC, M>,
 }
 
 /// A context of an existing [`File`].
@@ -23,7 +25,8 @@ pub struct File<'a, IO: ReadWriteSeek, TP, OCC> {
 /// operations on a [`File`] with the [`DirEntry::to_file_with_context`](crate::dir_entry::DirEntry::to_file_with_context)
 /// method. This can be useful for large files, because to `Seek` to the
 /// end of the file would mean scanning the whole cluster chain which
-/// has `O(n)` time complexity.
+/// has `O(n)` time complexity. The context caches the last cluster so that
+/// reopening a file and seeking to the end is O(1) after the first traversal.
 #[derive(Clone)]
 pub struct FileContext {
     // Note first_cluster is None if file is empty
@@ -34,6 +37,8 @@ pub struct FileContext {
     pub(crate) offset: u32,
     // file dir entry editor - None for root dir
     pub(crate) entry: Option<DirEntryEditor>,
+    // Cached last cluster of the chain; None means unknown (not yet traversed or file empty)
+    pub(crate) last_cluster: Option<u32>,
 }
 
 /// An extent containing a file's data on disk.
@@ -48,11 +53,11 @@ pub struct Extent {
     pub size: u32,
 }
 
-impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
+impl<'a, IO: ReadWriteSeek, TP, OCC, M: RawMutex> File<'a, IO, TP, OCC, M> {
     pub(crate) fn new(
         first_cluster: Option<u32>,
         entry: Option<DirEntryEditor>,
-        fs: &'a FileSystem<IO, TP, OCC>,
+        fs: &'a FileSystem<IO, TP, OCC, M>,
     ) -> Self {
         File {
             context: FileContext {
@@ -60,6 +65,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 entry,
                 current_cluster: None, // cluster before first one
                 offset: 0,
+                last_cluster: None,
             },
             fs,
         }
@@ -74,7 +80,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     ///
     /// Prefer using [`DirEntry::try_to_file_with_context`](crate::dir_entry::DirEntry::try_to_file_with_context) where possible because
     /// it does some basic checks to avoid file corruption.
-    pub(crate) fn new_from_context(context: FileContext, fs: &'a FileSystem<IO, TP, OCC>) -> Self {
+    pub(crate) fn new_from_context(context: FileContext, fs: &'a FileSystem<IO, TP, OCC, M>) -> Self {
         File { context, fs }
     }
 
@@ -241,13 +247,13 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
 
     async fn flush(&mut self) -> Result<(), Error<IO::Error>> {
         self.flush_dir_entry().await?;
-        let mut disk = self.fs.disk.borrow_mut();
+        let mut disk = self.fs.disk.lock().await;
         disk.flush().await?;
         Ok(())
     }
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC, M: RawMutex> File<'_, IO, TP, OCC, M> {
     fn update_dir_entry_after_write(&mut self) {
         let offset = self.context.offset;
         if let Some(ref mut e) = self.context.entry {
@@ -263,17 +269,33 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
     ///
     /// A [`FileContext`] is returned, which can be used in conjunction with the
     /// `to_file_with_context` API.
+    ///
+    /// Note: this does **not** flush the file. Call [`flush`](embedded_io_async::Write::flush)
+    /// first, or use [`close_and_flush`] to flush and close atomically.
     pub async fn close(self) -> Result<FileContext, Error<IO::Error>> {
         Ok(FileContext {
             first_cluster: self.context.first_cluster,
             current_cluster: self.context.current_cluster,
             offset: self.context.offset,
             entry: self.context.entry.clone(),
+            last_cluster: self.context.last_cluster,
         })
+    }
+
+    /// Flush the file and close it, returning a [`FileContext`].
+    ///
+    /// This is the safe alternative to calling [`flush`](embedded_io_async::Write::flush)
+    /// followed by [`close`]. It avoids the `dirty-file-panic` trap and caches the current
+    /// position (including `last_cluster`) so that reopening via
+    /// [`DirEntry::to_file_with_context`](crate::dir_entry::DirEntry::to_file_with_context)
+    /// allows O(1) seek-to-end.
+    pub async fn close_and_flush(mut self) -> Result<FileContext, Error<IO::Error>> {
+        Self::flush(&mut self).await?;
+        self.close().await
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Drop for File<'_, IO, TP, OCC, M> {
     fn drop(&mut self) {
         if let Some(e) = &self.context.entry {
             if e.dirty() {
@@ -288,7 +310,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
 }
 
 // Note: derive cannot be used because of invalid bounds. See: https://github.com/rust-lang/rust/issues/26925
-impl<IO: ReadWriteSeek, TP, OCC> Clone for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Clone for File<'_, IO, TP, OCC, M> {
     fn clone(&self) -> Self {
         File {
             context: self.context.clone(),
@@ -297,11 +319,11 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for File<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> IoBase for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> IoBase for File<'_, IO, TP, OCC, M> {
     type Error = Error<IO::Error>;
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC, M: RawMutex> Read for File<'_, IO, TP, OCC, M> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         trace!("File::read");
         let cluster_size = self.fs.cluster_size();
@@ -335,7 +357,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
         trace!("read {} bytes in cluster {}", read_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
         let read_bytes = {
-            let mut disk = self.fs.disk.borrow_mut();
+            let mut disk = self.fs.disk.lock().await;
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
             disk.read(&mut buf[..read_size]).await?
         };
@@ -355,7 +377,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC, M: RawMutex> Write for File<'_, IO, TP, OCC, M> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         trace!("File::write");
         let cluster_size = self.fs.cluster_size();
@@ -396,6 +418,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
                 if self.context.first_cluster.is_none() {
                     self.set_first_cluster(new_cluster);
                 }
+                // New cluster is appended at end of chain
+                self.context.last_cluster = Some(new_cluster);
                 new_cluster
             }
         } else {
@@ -408,7 +432,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         trace!("write {} bytes in cluster {}", write_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
         let written_bytes = {
-            let mut disk = self.fs.disk.borrow_mut();
+            let mut disk = self.fs.disk.lock().await;
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
             disk.write(&buf[..write_size]).await?
         };
@@ -427,7 +451,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Seek for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Seek for File<'_, IO, TP, OCC, M> {
     async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
         trace!("File::seek");
         let size_opt = self.size();
@@ -469,22 +493,61 @@ impl<IO: ReadWriteSeek, TP, OCC> Seek for File<'_, IO, TP, OCC> {
         } else if new_offset_in_clusters == old_offset_in_clusters {
             self.context.current_cluster
         } else if let Some(first_cluster) = self.context.first_cluster {
-            // calculate number of clusters to skip
-            // return the previous cluster if the offset points to the cluster boundary
             // Note: new_offset_in_clusters cannot be 0 here because new_offset is not 0
             debug_assert!(new_offset_in_clusters > 0);
-            let clusters_to_skip = new_offset_in_clusters - 1;
-            let mut cluster = first_cluster;
-            let mut iter = self.fs.cluster_iter(first_cluster);
-            for i in 0..clusters_to_skip {
+
+            // Cluster index (1-based) of the file's last byte; None for empty files.
+            let file_last_cluster_idx = size_opt
+                .filter(|&s| s > 0)
+                .map(|s| self.fs.clusters_from_bytes(u64::from(s)));
+
+            // Optimisation A: O(1) seek-to-end when the last cluster is cached.
+            if let (Some(last_c), Some(end_idx)) = (self.context.last_cluster, file_last_cluster_idx) {
+                if new_offset_in_clusters == end_idx {
+                    self.context.offset = new_offset;
+                    self.context.current_cluster = Some(last_c);
+                    return Ok(u64::from(new_offset));
+                }
+            }
+
+            // Optimisation B: when seeking forward, start from current_cluster instead
+            // of first_cluster to avoid re-traversing already-visited clusters.
+            let (walk_start, steps) = if old_offset_in_clusters > 0
+                && new_offset_in_clusters > old_offset_in_clusters
+            {
+                if let Some(cur) = self.context.current_cluster {
+                    (cur, new_offset_in_clusters - old_offset_in_clusters)
+                } else {
+                    (first_cluster, new_offset_in_clusters - 1)
+                }
+            } else {
+                (first_cluster, new_offset_in_clusters - 1)
+            };
+
+            let mut cluster = walk_start;
+            let mut iter = self.fs.cluster_iter(walk_start);
+            for i in 0..steps {
                 cluster = if let Some(r) = iter.next().await {
                     r?
                 } else {
                     // cluster chain ends before the new position - seek to the end of the last cluster
-                    new_offset = self.fs.bytes_from_clusters(i + 1) as u32;
+                    let clusters_visited = if walk_start == first_cluster {
+                        i + 1
+                    } else {
+                        old_offset_in_clusters + i + 1
+                    };
+                    new_offset = self.fs.bytes_from_clusters(clusters_visited) as u32;
                     break;
                 };
             }
+
+            // Cache the last cluster whenever the walk lands on it.
+            if let Some(end_idx) = file_last_cluster_idx {
+                if new_offset_in_clusters == end_idx {
+                    self.context.last_cluster = Some(cluster);
+                }
+            }
+
             Some(cluster)
         } else {
             // empty file - always seek to 0
