@@ -5,6 +5,8 @@ use core::cmp;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::u32;
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
+use embassy_sync::mutex::Mutex;
 
 #[cfg(all(not(feature = "std"), feature = "alloc", feature = "lfn"))]
 use alloc::string::String;
@@ -321,8 +323,8 @@ impl FileSystemStats {
 /// A FAT filesystem object.
 ///
 /// `FileSystem` struct is representing a state of a mounted FAT volume.
-pub struct FileSystem<IO: Read + Write + Seek, TP, OCC> {
-    pub(crate) disk: RefCell<IO>,
+pub struct FileSystem<IO: Read + Write + Seek, TP, OCC, M: RawMutex = NoopRawMutex> {
+    pub(crate) disk: Mutex<M, IO>,
     pub(crate) options: FsOptions<TP, OCC>,
     fat_type: FatType,
     bpb: BiosParameterBlock,
@@ -353,7 +355,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + tokio::io::AsyncSeek + Un
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> FileSystem<IO, TP, OCC, M> {
     /// Creates a new filesystem object instance.
     ///
     /// Supplied `storage` parameter cannot be seeked. If there is a need to read a fragment of disk
@@ -413,7 +415,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let status_flags = bpb.status_flags();
         trace!("FileSystem::new end");
         Ok(Self {
-            disk: RefCell::new(disk),
+            disk: Mutex::new(disk),
             options,
             fat_type,
             bpb,
@@ -510,7 +512,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             alloc_cluster(&mut fat, self.fat_type, prev_cluster, hint, self.total_clusters).await?
         };
         if zero {
-            let mut disk = self.disk.borrow_mut();
+            let mut disk = self.disk.lock().await;
             disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster))).await?;
             write_zeros(&mut *disk, u64::from(self.cluster_size())).await?;
         }
@@ -588,7 +590,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     async fn flush_fs_info(&self) -> Result<(), Error<IO::Error>> {
         let mut fs_info = self.fs_info.borrow_mut();
         if self.fat_type == FatType::Fat32 && fs_info.dirty {
-            let mut disk = self.disk.borrow_mut();
+            let mut disk = self.disk.lock().await;
             let fs_info_sector_offset = self.offset_from_sector(u32::from(self.bpb.fs_info_sector));
             disk.seek(SeekFrom::Start(fs_info_sector_offset)).await?;
             fs_info.serialize(&mut *disk).await?;
@@ -615,16 +617,17 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         } else {
             0x025
         };
-        let mut disk = self.disk.borrow_mut();
+        let mut disk = self.disk.lock().await;
         disk.seek(io::SeekFrom::Start(offset)).await?;
         disk.write_u8(encoded).await?;
         disk.flush().await?;
+        drop(disk);
         self.current_status_flags.set(flags);
         Ok(())
     }
 
     /// Returns a root directory object allowing for futher penetration of a filesystem structure.
-    pub fn root_dir(&self) -> Dir<IO, TP, OCC> {
+    pub fn root_dir(&self) -> Dir<IO, TP, OCC, M> {
         trace!("root_dir");
         let root_rdr = {
             match self.fat_type {
@@ -642,7 +645,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC: OemCpConverter> FileSystem<IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC: OemCpConverter, M: RawMutex> FileSystem<IO, TP, OCC, M> {
     /// Returns a volume label from BPB in the Boot Sector as `String`.
     ///
     /// Non-ASCII characters are replaced by the replacement character (U+FFFD).
@@ -658,7 +661,7 @@ impl<IO: ReadWriteSeek, TP, OCC: OemCpConverter> FileSystem<IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter, M: RawMutex> FileSystem<IO, TP, OCC, M> {
     /// Returns a volume label from root directory as `String`.
     ///
     /// It finds file with `VOLUME_ID` attribute and returns its short name.
@@ -701,7 +704,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP
 }
 
 /// `Drop` implementation tries to unmount the filesystem when dropping.
-impl<IO: Read + Write + Seek, TP, OCC> Drop for FileSystem<IO, TP, OCC> {
+impl<IO: Read + Write + Seek, TP, OCC, M: RawMutex> Drop for FileSystem<IO, TP, OCC, M> {
     fn drop(&mut self) {
         if self.current_status_flags.get().dirty {
             warn!("Dropping FileSytem without unmount");
@@ -709,23 +712,23 @@ impl<IO: Read + Write + Seek, TP, OCC> Drop for FileSystem<IO, TP, OCC> {
     }
 }
 
-pub(crate) struct FsIoAdapter<'a, IO: ReadWriteSeek, TP, OCC> {
-    fs: &'a FileSystem<IO, TP, OCC>,
+pub(crate) struct FsIoAdapter<'a, IO: ReadWriteSeek, TP, OCC, M: RawMutex> {
+    fs: &'a FileSystem<IO, TP, OCC, M>,
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> IoBase for FsIoAdapter<'_, IO, TP, OCC, M> {
     type Error = IO::Error;
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Read for FsIoAdapter<'_, IO, TP, OCC, M> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.fs.disk.borrow_mut().read(buf).await
+        self.fs.disk.lock().await.read(buf).await
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Write for FsIoAdapter<'_, IO, TP, OCC, M> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let size = self.fs.disk.borrow_mut().write(buf).await?;
+        let size = self.fs.disk.lock().await.write(buf).await?;
         if size > 0 {
             self.fs.set_dirty_flag(true).await?;
         }
@@ -733,18 +736,18 @@ impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.fs.disk.borrow_mut().flush().await
+        self.fs.disk.lock().await.flush().await
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Seek for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Seek for FsIoAdapter<'_, IO, TP, OCC, M> {
     async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
-        self.fs.disk.borrow_mut().seek(pos).await
+        self.fs.disk.lock().await.seek(pos).await
     }
 }
 
 // Note: derive cannot be used because of invalid bounds. See: https://github.com/rust-lang/rust/issues/26925
-impl<IO: ReadWriteSeek, TP, OCC> Clone for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Clone for FsIoAdapter<'_, IO, TP, OCC, M> {
     fn clone(&self) -> Self {
         FsIoAdapter { fs: self.fs }
     }
