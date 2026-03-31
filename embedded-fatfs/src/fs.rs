@@ -331,7 +331,7 @@ pub struct FileSystem<IO: Read + Write + Seek, TP, OCC, M: RawMutex = NoopRawMut
     first_data_sector: u32,
     root_dir_sectors: u32,
     total_clusters: u32,
-    fs_info: RefCell<FsInfoSector>,
+    fs_info: RefCell<FsInfoSector>, // intentional RefCell: always accessed synchronously (never across an .await)
     current_status_flags: Cell<FsStatusFlags>,
 }
 
@@ -627,7 +627,7 @@ impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> FileSystem<IO, TP, OCC, M> {
     }
 
     /// Returns a root directory object allowing for futher penetration of a filesystem structure.
-    pub fn root_dir(&self) -> Dir<IO, TP, OCC, M> {
+    pub fn root_dir(&self) -> Dir<'_, IO, TP, OCC, M> {
         trace!("root_dir");
         let root_rdr = {
             match self.fat_type {
@@ -728,6 +728,8 @@ impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Read for FsIoAdapter<'_, IO, TP, O
 
 impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> Write for FsIoAdapter<'_, IO, TP, OCC, M> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        // The disk lock is acquired then released before set_dirty_flag acquires it again.
+        // These are two sequential (non-nested) acquisitions — safe for any RawMutex.
         let size = self.fs.disk.lock().await.write(buf).await?;
         if size > 0 {
             self.fs.set_dirty_flag(true).await?;
