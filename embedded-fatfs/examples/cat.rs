@@ -1,11 +1,12 @@
 use std::env;
 
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_fatfs::{FileSystem, FsOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let file = tokio::fs::File::open("resources/fat32.img").await?;
-    let fs = FileSystem::new(file, FsOptions::new()).await?;
+    let fs: FileSystem<_, _, _, NoopRawMutex> = FileSystem::new(file, FsOptions::new()).await?;
     let root_dir = fs.root_dir();
     let mut file = root_dir
         .open_file(&env::args().nth(1).expect("filename expected"))

@@ -1,4 +1,5 @@
 use anyhow::Context;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_fatfs::{FileSystem, FsOptions};
 use embedded_io_async::Write;
 use tokio::fs::OpenOptions;
@@ -15,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to open image!")?;
     let buf_stream = BufStream::new(img_file);
     let options = FsOptions::new().update_accessed_date(true);
-    let fs = FileSystem::new(buf_stream, options).await?;
+    let fs: FileSystem<_, _, _, NoopRawMutex> = FileSystem::new(buf_stream, options).await?;
     {
         // create a dir
         fs.root_dir().create_dir("foo").await?;

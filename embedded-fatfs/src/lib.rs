@@ -13,6 +13,7 @@
 //! # Examples
 //!
 //! ```rust
+//! use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 //! use tokio::fs;
 //! use embedded_io_async::Write;
 //!
@@ -23,7 +24,7 @@
 //!     let img_file = fs::OpenOptions::new().read(true).write(true)
 //!         .open("tmp/fat.img").await?;
 //!     let buf_stream = tokio::io::BufStream::new(img_file);
-//!     let fs = embedded_fatfs::FileSystem::new(buf_stream, embedded_fatfs::FsOptions::new()).await?;
+//!     let fs: embedded_fatfs::FileSystem<_, _, _, NoopRawMutex> = embedded_fatfs::FileSystem::new(buf_stream, embedded_fatfs::FsOptions::new()).await?;
 //!     let root_dir = fs.root_dir();
 //!
 //!     // Write a file

@@ -1,6 +1,7 @@
 use std::env;
 
 use chrono::{DateTime, Local};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_fatfs::{FileSystem, FsOptions};
 
 fn format_file_size(size: u64) -> String {
@@ -21,7 +22,7 @@ fn format_file_size(size: u64) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let file = tokio::fs::File::open("resources/fat32.img").await?;
-    let fs = FileSystem::new(file, FsOptions::new()).await?;
+    let fs: FileSystem<_, _, _, NoopRawMutex> = FileSystem::new(file, FsOptions::new()).await?;
     let root_dir = fs.root_dir();
     let dir = match env::args().nth(1) {
         None => root_dir,
