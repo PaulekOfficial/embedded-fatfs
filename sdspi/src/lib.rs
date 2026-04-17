@@ -29,19 +29,19 @@ pub const DATA_RES_MASK: u8 = 0x1F;
 /// Write data accepted token
 pub const DATA_RES_ACCEPTED: u8 = 0x05;
 
+/// Metadata about a successfully initialised SD card.
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-/// SD Card
 pub struct Card {
-    /// The type of this card
+    /// Capacity class: Standard (SDSC) or High/Extended (SDHC/SDXC).
     pub card_type: CardCapacity,
-    /// Operation Conditions Register
+    /// Operating Conditions Register — valid voltage ranges.
     pub ocr: OCR<SD>,
-    /// Relative Card Address
+    /// Relative Card Address assigned during initialisation.
     pub rca: u32,
-    /// Card ID
+    /// Card Identification register — manufacturer and serial number.
     pub cid: CID<SD>,
-    /// Card Specific Data
+    /// Card Specific Data — capacity, speed, erase geometry.
     pub csd: CSD<SD>,
 }
 
@@ -53,19 +53,30 @@ impl Card {
     }
 }
 
+/// Errors that can be returned by [`SdSpi`] operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
+    /// Failed to drive the chip-select pin.
     ChipSelect,
+    /// SPI bus returned an error.
     SpiError,
+    /// Card did not respond within the retry limit.
     Timeout,
+    /// Card type is not supported (e.g. MMC, SD 1.0 without CCS).
     UnsupportedCard,
+    /// CMD58 (READ_OCR) failed or returned an unexpected response.
     Cmd58Error,
+    /// CMD59 (CRC_ON_OFF) failed or returned an unexpected response.
     Cmd59Error,
+    /// A register read returned an error status byte.
     RegisterError(u8),
+    /// CRC mismatch: `(expected, actual)`.
     CrcMismatch(u16, u16),
+    /// Operation attempted before [`SdSpi::init`] succeeded.
     NotInitialized,
+    /// Card signalled a write error in the data response token.
     WriteError,
 }
 
@@ -143,6 +154,7 @@ where
     D: embedded_hal_async::delay::DelayNs + Clone,
     ALIGN: aligned::Alignment,
 {
+    /// Create a new driver; call [`init`](SdSpi::init) before any block I/O.
     pub fn new(spi: SPI, cs: CS, delay: D) -> Self {
         Self {
             spi,
@@ -253,6 +265,7 @@ where
         Ok(())
     }
 
+    /// Read one or more consecutive `SIZE`-byte blocks starting at `block_address`.
     pub async fn read<const SIZE: usize>(
         &mut self,
         block_address: u32,
@@ -290,6 +303,7 @@ where
         result
     }
 
+    /// Write one or more consecutive `SIZE`-byte blocks starting at `block_address`.
     pub async fn write<const SIZE: usize>(
         &mut self,
         block_address: u32,
@@ -385,6 +399,7 @@ where
         }
     }
 
+    /// Return the total card capacity in bytes.
     pub async fn size(&mut self) -> Result<u64, Error> {
         Ok(self.card.ok_or(Error::NotInitialized)?.size())
     }
