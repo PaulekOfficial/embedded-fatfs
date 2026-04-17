@@ -90,6 +90,13 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+#[cfg(feature = "embedded-io")]
+impl embedded_io::Error for Error {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        embedded_io::ErrorKind::Other
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 /// High-level view of the card state in SPI mode
