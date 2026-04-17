@@ -31,6 +31,9 @@ defmt = ["dep:defmt"]
 # panic when dropping dirty files, files should be flushed before hand
 dirty-file-panic = []
 
+# SD card SPI driver + convenience mount API
+sdspi = ["dep:sdspi", "dep:block-device-adapters", "dep:embedded-hal-async", "dep:embedded-hal", "dep:aligned"]
+
 # Default features
 default = ["chrono", "std", "alloc", "lfn", "unicode", "log"]
 
@@ -48,6 +51,11 @@ elain = { version = "0.3", optional = true }
 log = { version = "0.4", optional = true }
 defmt = { version = "1.0.1", optional = true }
 embassy-sync = { version = "0.8", default-features = false }
+block-device-adapters = { path = "../block-device-adapters", optional = true }
+sdspi              = { path = "../sdspi", optional = true, features = ["embedded-io"] }
+embedded-hal-async = { version = "1", optional = true }
+embedded-hal       = { version = "1", optional = true }
+aligned            = { version = "0.4", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11.5"
