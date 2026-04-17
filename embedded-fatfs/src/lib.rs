@@ -66,6 +66,9 @@ extern crate alloc;
 // MUST be the first module listed
 mod fmt;
 
+#[cfg(feature = "sdspi")]
+pub mod sd;
+
 mod boot_sector;
 mod dir;
 mod dir_entry;
