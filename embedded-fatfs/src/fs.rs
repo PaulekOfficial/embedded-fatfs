@@ -573,8 +573,16 @@ impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> FileSystem<IO, TP, OCC, M> {
     /// # Errors
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
-    pub async fn unmount(self) -> Result<(), Error<IO::Error>> {
-        self.flush().await
+    pub async fn unmount(self) -> Result<IO, Error<IO::Error>> {
+        self.flush().await?;
+        // SAFETY: ManuallyDrop prevents our Drop impl from running on `no_drop`.
+        // We have already flushed above. The remaining fields (bpb, options, etc.)
+        // contain no heap resources in any built-in TP/OCC implementation, so
+        // leaving them without an explicit drop call is safe for the intended
+        // embedded use-cases. Callers with heap-allocating TP/OCC should drop
+        // those resources separately.
+        let no_drop = core::mem::ManuallyDrop::new(self);
+        Ok(unsafe { core::ptr::read(&no_drop.disk) }.into_inner())
     }
 
     /// Flushes any in memory state to the filesystem
