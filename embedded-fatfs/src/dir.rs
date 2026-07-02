@@ -563,7 +563,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter, M: RawMutex> 
 
         // traverse destination path
         let mut split_dst = split_path(dst_path);
-        let mut e_dst = self.clone();
+        let mut e_dst = dst_dir.clone();
         loop {
             let (name, rest_opt) = split_dst;
             match rest_opt {
@@ -577,7 +577,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter, M: RawMutex> 
             }
         }
 
-        e_src.rename_internal(split_src.0, &dst_dir, split_dst.0).await
+        e_src.rename_internal(split_src.0, &e_dst, split_dst.0).await
     }
 
     async fn rename_internal(
