@@ -89,13 +89,48 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
     async fn flush(&mut self) -> Result<(), T::Error> {
         // flush the internal buffer if we have modified the buffer
         if self.dirty {
-            self.dirty = false;
             // Note, alignment of internal buffer is guarenteed at compile time so we don't have to check it here
             self.inner
                 .write(self.current_block, slice_to_blocks(&self.buffer[..]))
                 .await?;
+            // only now is the cached data on the device - keeping `dirty` set until the write
+            // succeeded makes a failed flush retryable instead of silently dropping the data
+            self.dirty = false;
         }
         Ok(())
+    }
+
+    /// Number of blocks covered by `buf`, used to decide whether a direct access overlaps the cache.
+    fn blocks_in(buf_len: usize) -> u32 {
+        (buf_len / SIZE) as u32
+    }
+
+    /// True when the cached block is inside the `count` blocks starting at `first`.
+    fn cache_overlaps(&self, first: u32, count: u32) -> bool {
+        self.current_block != u32::MAX
+            && self.current_block >= first
+            && (self.current_block - first) < count
+    }
+
+    /// Called before a direct (cache bypassing) access to `count` blocks at `first`.
+    ///
+    /// The cached block has to reach the device first, otherwise a direct read could return stale
+    /// data or a later flush could overwrite what the direct write just stored.
+    async fn before_direct(&mut self, first: u32, count: u32) -> Result<(), T::Error> {
+        if self.dirty && self.cache_overlaps(first, count) {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Called after a direct write to `count` blocks at `first`: the cache is now stale.
+    fn after_direct_write(&mut self, first: u32, count: u32) {
+        if self.cache_overlaps(first, count) {
+            // drop the cached copy, it no longer matches the device
+            debug_assert!(!self.dirty, "cache must have been flushed before a direct write");
+            self.current_block = u32::MAX;
+            self.dirty = false;
+        }
     }
 
     async fn check_cache(&mut self) -> Result<(), T::Error> {
@@ -129,6 +164,8 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
             {
                 // If the provided buffer has a suitable length and alignment _and_ the read head is on a block boundary, use it directly
                 let block = self.pointer_block_start();
+                let blocks = Self::blocks_in(buf.len());
+                self.before_direct(block, blocks).await?;
                 self.inner.read(block, slice_to_blocks_mut(buf)).await?;
 
                 buf.len()
@@ -178,7 +215,10 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
             {
                 // If the provided buffer has a suitable length and alignment _and_ the write head is on a block boundary, use it directly
                 let block = self.pointer_block_start();
+                let blocks = Self::blocks_in(buf.len());
+                self.before_direct(block, blocks).await?;
                 self.inner.write(block, slice_to_blocks(buf)).await?;
+                self.after_direct_write(block, blocks);
 
                 buf.len()
             } else {
@@ -513,6 +553,165 @@ mod tests {
             &block.into_inner().0.into_inner().into_inner()[3..512],
             &aligned_buffer[3..]
         )
+    }
+
+    /// A block device that can be told to fail the next `n` writes, and records what it stored.
+    struct FlakyDevice {
+        blocks: std::collections::BTreeMap<u32, [u8; 512]>,
+        fail_writes: usize,
+        writes: usize,
+    }
+
+    impl FlakyDevice {
+        fn new() -> Self {
+            Self {
+                blocks: std::collections::BTreeMap::new(),
+                fail_writes: 0,
+                writes: 0,
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FlakyError;
+
+    impl core::fmt::Display for FlakyError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "flaky")
+        }
+    }
+
+    impl core::error::Error for FlakyError {}
+
+    impl embedded_io::Error for FlakyError {
+        fn kind(&self) -> embedded_io::ErrorKind {
+            embedded_io::ErrorKind::Other
+        }
+    }
+
+    impl BlockDevice<512> for FlakyDevice {
+        type Error = FlakyError;
+        type Align = aligned::A4;
+
+        async fn read(
+            &mut self,
+            block_address: u32,
+            data: &mut [Aligned<Self::Align, [u8; 512]>],
+        ) -> Result<(), Self::Error> {
+            for (i, b) in data.iter_mut().enumerate() {
+                let block = self.blocks.get(&(block_address + i as u32)).copied().unwrap_or([0; 512]);
+                b[..].copy_from_slice(&block);
+            }
+            Ok(())
+        }
+
+        async fn write(
+            &mut self,
+            block_address: u32,
+            data: &[Aligned<Self::Align, [u8; 512]>],
+        ) -> Result<(), Self::Error> {
+            if self.fail_writes > 0 {
+                self.fail_writes -= 1;
+                return Err(FlakyError);
+            }
+            self.writes += 1;
+            for (i, b) in data.iter().enumerate() {
+                let mut block = [0_u8; 512];
+                block.copy_from_slice(&b[..]);
+                self.blocks.insert(block_address + i as u32, block);
+            }
+            Ok(())
+        }
+
+        async fn size(&mut self) -> Result<u64, Self::Error> {
+            Ok(u64::MAX)
+        }
+    }
+
+    /// A failed flush must keep the data in the cache so the caller can retry it.
+    #[tokio::test]
+    async fn failed_flush_is_retryable() {
+        let mut dev = FlakyDevice::new();
+        dev.fail_writes = 1;
+        let mut block: BufStream<_, 512> = BufStream::new(dev);
+
+        block.seek(SeekFrom::Start(4)).await.unwrap();
+        block.write_all(b"payload").await.unwrap();
+
+        assert!(Write::flush(&mut block).await.is_err(), "the injected error must surface");
+        // the retry has to actually write, so check the device rather than the cache
+        Write::flush(&mut block).await.unwrap();
+
+        let dev = block.into_inner();
+        let stored = dev.blocks.get(&0).expect("nothing reached the device, the retry was a no-op");
+        assert_eq!(&stored[4..11], b"payload");
+    }
+
+    /// A direct (block aligned) write must not be resurrected by a stale cache.
+    #[tokio::test]
+    async fn direct_write_invalidates_the_cache() {
+        let dev = FlakyDevice::new();
+        let mut block: BufStream<_, 512> = BufStream::new(dev);
+
+        // dirty the cache for block 0 through the slow path
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.write_all(&[0xAA; 8]).await.unwrap();
+
+        // now overwrite the whole of block 0 directly
+        let mut aligned: Aligned<A4, [u8; 512]> = Aligned([0xBB; 512]);
+        aligned[0] = 0xCC;
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.write_all(&aligned[..]).await.unwrap();
+        Write::flush(&mut block).await.unwrap();
+
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut buf = [0_u8; 16];
+        block.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], 0xCC, "direct write was lost");
+        assert_eq!(buf[1], 0xBB, "stale cached bytes came back");
+    }
+
+    /// A direct read must see data that is still sitting in the cache.
+    #[tokio::test]
+    async fn direct_read_sees_cached_writes() {
+        let dev = FlakyDevice::new();
+        let mut block: BufStream<_, 512> = BufStream::new(dev);
+
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.write_all(&[0xDD; 16]).await.unwrap();
+
+        let mut aligned: Aligned<A4, [u8; 512]> = Aligned([0; 512]);
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.read_exact(&mut aligned[..]).await.unwrap();
+        assert_eq!(&aligned[..16], &[0xDD; 16], "direct read returned stale data");
+    }
+
+    /// Cached and direct accesses interleaved across neighbouring blocks.
+    #[tokio::test]
+    async fn mixed_cached_and_direct_access() {
+        let dev = FlakyDevice::new();
+        let mut block: BufStream<_, 512> = BufStream::new(dev);
+
+        // slow path into block 1
+        block.seek(SeekFrom::Start(512 + 8)).await.unwrap();
+        block.write_all(b"cached").await.unwrap();
+
+        // direct write of block 0 must not disturb the cached block 1
+        let aligned: Aligned<A4, [u8; 512]> = Aligned([0x11; 512]);
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.write_all(&aligned[..]).await.unwrap();
+
+        // direct read of block 1 has to see the cached bytes
+        let mut read_back: Aligned<A4, [u8; 512]> = Aligned([0; 512]);
+        block.seek(SeekFrom::Start(512)).await.unwrap();
+        block.read_exact(&mut read_back[..]).await.unwrap();
+        assert_eq!(&read_back[8..14], b"cached", "cached write was not visible to a direct read");
+
+        Write::flush(&mut block).await.unwrap();
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut first = [0_u8; 4];
+        block.read_exact(&mut first).await.unwrap();
+        assert_eq!(first, [0x11; 4], "direct write to block 0 was lost");
     }
 
     #[tokio::test]

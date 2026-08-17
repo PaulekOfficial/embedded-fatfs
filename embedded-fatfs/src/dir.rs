@@ -427,21 +427,131 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter, M: RawMutex> 
             DirEntryOrShortName::ShortName(short_name) => {
                 // alloc cluster for directory data
                 let cluster = self.fs.alloc_cluster(None, true).await?;
-                // create entry in parent directory
+
+                // Write the contents of the new directory *before* the entry that points at it.
+                // Interrupting here leaves an allocated cluster nobody references - a bounded leak
+                // that a filesystem check reclaims - whereas the other order can leave a directory
+                // entry pointing at a cluster that never received its "." / ".." entries, which
+                // both this library and other implementations would then read as garbage.
+                let dir = Dir::new(DirRawStream::File(File::new(Some(cluster), None, self.fs)), self.fs);
+
+                // Note: dot entries must be written as bare short-name entries. Prefixing them
+                // with LFN entries makes the directory unreadable for other FAT implementations.
+                let dot_sfn = ShortNameGenerator::generate_dot();
+                let sfn_entry = e.create_sfn_entry(dot_sfn, FileAttributes::DIRECTORY, Some(cluster));
+                dir.write_sfn_entry(sfn_entry).await?;
+                let dotdot_sfn = ShortNameGenerator::generate_dotdot();
+                // ".." must point to cluster 0 when the parent directory is the root directory
+                let parent_cluster = match (e.stream.first_cluster(), self.fs.root_dir_first_cluster()) {
+                    (Some(parent), Some(root)) if parent == root => None,
+                    (parent, _) => parent,
+                };
+                let sfn_entry = e.create_sfn_entry(dotdot_sfn, FileAttributes::DIRECTORY, parent_cluster);
+                dir.write_sfn_entry(sfn_entry).await?;
+
+                // only now does the directory become reachable
                 let sfn_entry = e.create_sfn_entry(short_name, FileAttributes::DIRECTORY, Some(cluster));
                 let entry = e.write_entry(name, sfn_entry).await?;
-                let dir = entry.to_dir();
-                // create special entries "." and ".."
-                let dot_sfn = ShortNameGenerator::generate_dot();
-                let sfn_entry = e.create_sfn_entry(dot_sfn, FileAttributes::DIRECTORY, entry.first_cluster());
-                dir.write_entry(".", sfn_entry).await?;
-                let dotdot_sfn = ShortNameGenerator::generate_dotdot();
-                let sfn_entry = e.create_sfn_entry(dotdot_sfn, FileAttributes::DIRECTORY, e.stream.first_cluster());
-                dir.write_entry("..", sfn_entry).await?;
-                Ok(dir)
+                Ok(entry.to_dir())
             }
             // directory already exists - return it
             DirEntryOrShortName::DirEntry(e) => Ok(e.to_dir()),
+        }
+    }
+
+    /// Publishes `src_name` under `dst_name` in a way that never loses the data.
+    ///
+    /// The destination entry is written and flushed **first**, then the source entry is unlinked
+    /// (its cluster chain is left alone, because the destination now owns it). An interruption
+    /// therefore leaves one of three states, all of which a caller can resolve on the next run:
+    ///
+    /// * source only - nothing happened, publish again;
+    /// * source and destination sharing a first cluster - the copy went through, unlink the source
+    ///   with [`unlink_entry_keep_chain`](Self::unlink_entry_keep_chain);
+    /// * destination only - finished.
+    ///
+    /// `src_path` and `dst_path` are '/' separated paths relative to self.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotFound` if the source does not exist.
+    /// * `Error::AlreadyExists` if the destination exists and is not the source itself.
+    /// * `Error::InvalidInput` if the source is a directory - only files can be published.
+    /// * `Error::Io` on an underlying storage error.
+    pub async fn publish_entry(&self, src_path: &str, dst_path: &str) -> Result<(), Error<IO::Error>> {
+        trace!("Dir::publish_entry {} {}", src_path, dst_path);
+        let (src_parent, src_name) = self.resolve_parent(src_path).await?;
+        let (dst_parent, dst_name) = self.resolve_parent(dst_path).await?;
+
+        let source = src_parent.find_entry(src_name, Some(false), None).await?;
+        let short_name = match dst_parent.check_for_existence(dst_name, None).await? {
+            DirEntryOrShortName::DirEntry(ref existing) => {
+                if source.is_same_entry(existing) {
+                    return Ok(());
+                }
+                if source.is_published_as(existing) {
+                    // The destination reached the device before a previous attempt was interrupted.
+                    // It already owns the cluster chain, so finish by removing only the source name.
+                    return src_parent.unlink_entry(&source).await;
+                }
+                return Err(Error::AlreadyExists);
+            }
+            DirEntryOrShortName::ShortName(short_name) => short_name,
+        };
+
+        // 1. the destination becomes durable while the source still exists
+        let dst_entry = source.data.renamed(short_name);
+        dst_parent.write_entry(dst_name, dst_entry).await?;
+
+        // 2. only now does the source entry go away, keeping its clusters
+        src_parent.unlink_entry(&source).await
+    }
+
+    /// Removes a directory entry without freeing its cluster chain.
+    ///
+    /// Used to clean up the source of an interrupted [`publish_entry`](Self::publish_entry), where
+    /// the data is already owned by the published entry.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotFound` if `path` does not exist.
+    /// * `Error::InvalidInput` if `path` is a directory.
+    /// * `Error::Io` on an underlying storage error.
+    pub async fn unlink_entry_keep_chain(&self, path: &str) -> Result<(), Error<IO::Error>> {
+        trace!("Dir::unlink_entry_keep_chain {}", path);
+        let (parent, name) = self.resolve_parent(path).await?;
+        let entry = parent.find_entry(name, Some(false), None).await?;
+        parent.unlink_entry(&entry).await
+    }
+
+    /// Marks the long and short name entries of `entry` deleted. The cluster chain is untouched.
+    async fn unlink_entry(&self, entry: &DirEntry<'a, IO, TP, OCC, M>) -> Result<(), Error<IO::Error>> {
+        let mut stream = self.stream.clone();
+        stream.seek(SeekFrom::Start(entry.offset_range.0)).await?;
+        let num = ((entry.offset_range.1 - entry.offset_range.0) / u64::from(DIR_ENTRY_SIZE)) as usize;
+        for _ in 0..num {
+            let mut data = DirEntryData::deserialize(&mut stream).await?;
+            data.set_deleted();
+            stream.seek(SeekFrom::Current(-i64::from(DIR_ENTRY_SIZE))).await?;
+            data.serialize(&mut stream).await?;
+        }
+        stream.flush().await?;
+        Ok(())
+    }
+
+    /// Splits `path` into the directory holding the last component and that component.
+    async fn resolve_parent<'p>(&self, path: &'p str) -> Result<(Self, &'p str), Error<IO::Error>> {
+        let mut split = split_path(path);
+        let mut parent = self.clone();
+        loop {
+            let (name, rest_opt) = split;
+            match rest_opt {
+                Some(rest) => {
+                    split = split_path(rest);
+                    parent = parent.find_entry(name, Some(true), None).await?.to_dir();
+                }
+                None => return Ok((parent, name)),
+            }
         }
     }
 
@@ -621,6 +731,12 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter, M: RawMutex> 
         dst_dir.write_entry(dst_name, sfn_entry).await?;
 
         // rename requires stream flush (no async drop :()
+        //
+        // Note on interruptions: this is the historic ordering, where the destination entry can
+        // reach the device before the source removal does, leaving two entries on one cluster
+        // chain. Callers that need a recoverable publish - where the data must not be lost if the
+        // operation is cut in half - should use `publish_entry` instead, which makes that state
+        // explicit and cleanable.
         stream.flush().await?;
         Ok(())
     }
@@ -703,6 +819,17 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter, M: RawMutex> 
             lfn_entry.serialize(&mut stream).await?;
         }
         Ok((stream, start_pos))
+    }
+
+    /// Writes a short-name-only directory entry (no preceding LFN entries).
+    ///
+    /// Used for the "." and ".." entries, which must not carry a long name.
+    async fn write_sfn_entry(&self, raw_entry: DirFileEntryData) -> Result<(), Error<IO::Error>> {
+        let mut stream = self.find_free_entries(1).await?;
+        raw_entry.serialize(&mut stream).await?;
+        // explicit flush call because async drop doesn't exist
+        stream.flush().await?;
+        Ok(())
     }
 
     async fn write_entry(

@@ -277,7 +277,10 @@ impl DirFileEntryData {
         wrt.write_u16_le(self.modify_date).await?;
         wrt.write_u16_le(self.first_cluster_lo).await?;
         wrt.write_u32_le(self.size).await?;
-        wrt.flush().await?;
+        // Note: no flush here on purpose. A caller that writes a set of entries (long name entries
+        // followed by the short name entry) flushes once at the end, so the whole set reaches the
+        // device in as few physical writes as possible - flushing per entry leaves half written
+        // sets behind when a write fails in the middle.
         Ok(())
     }
 
@@ -350,7 +353,7 @@ impl DirLfnEntryData {
         for ch in &self.name_2 {
             wrt.write_u16_le(*ch).await?;
         }
-        wrt.flush().await?;
+        // see the note in DirFileEntryData::serialize: the caller flushes the whole entry set
         Ok(())
     }
 
@@ -657,6 +660,15 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter, M: RawMutex> DirEntry<'a, I
 
     pub(crate) fn is_same_entry(&self, other: &DirEntry<IO, TP, OCC, M>) -> bool {
         self.entry_pos == other.entry_pos
+    }
+
+    /// True when `other` is the durable destination created from this entry by `publish_entry`.
+    ///
+    /// The destination has a different short name but otherwise identical metadata and owns the
+    /// same non-empty cluster chain. Requiring a cluster avoids treating two unrelated empty files
+    /// with identical timestamps as an interrupted publish.
+    pub(crate) fn is_published_as(&self, other: &DirEntry<IO, TP, OCC, M>) -> bool {
+        self.first_cluster().is_some() && self.data.renamed(*other.data.name()) == other.data
     }
 
     /// Returns `File` struct for this entry.

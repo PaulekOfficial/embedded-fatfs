@@ -467,6 +467,13 @@ impl<IO: ReadWriteSeek, TP, OCC, M: RawMutex> FileSystem<IO, TP, OCC, M> {
         self.offset_from_sector(self.sector_from_cluster(cluster))
     }
 
+    pub(crate) fn root_dir_first_cluster(&self) -> Option<u32> {
+        match self.fat_type {
+            FatType::Fat32 => Some(self.bpb.root_dir_first_cluster),
+            FatType::Fat12 | FatType::Fat16 => None,
+        }
+    }
+
     pub(crate) fn bytes_from_clusters(&self, clusters: u32) -> u64 {
         self.bpb.bytes_from_sectors(self.bpb.sectors_from_clusters(clusters))
     }
