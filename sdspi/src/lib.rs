@@ -3,9 +3,8 @@
 #![no_std]
 
 use aligned::Aligned;
-use core::future::Future;
 use core::marker::PhantomData;
-use embassy_futures::select::{select, Either};
+use embassy_futures::yield_now;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
@@ -28,6 +27,16 @@ pub const WRITE_MULTIPLE_TOKEN: u8 = 0xFC;
 pub const DATA_RES_MASK: u8 = 0x1F;
 /// Write data accepted token
 pub const DATA_RES_ACCEPTED: u8 = 0x05;
+
+/// Bytes clocked per busy-poll transfer in `wait_idle_raw`.
+const BUSY_POLL_CHUNK: usize = 16;
+/// Back-to-back polls before yielding to the executor.
+const SPIN_POLLS: u32 = 16;
+/// First and maximum sleep between polls once spinning gives up.
+const MIN_BACKOFF_US: u32 = 20;
+const MAX_BACKOFF_US: u32 = 500;
+/// Sleep between init command retries.
+const INIT_RETRY_US: u32 = 1000;
 
 /// Metadata about a successfully initialised SD card.
 #[derive(Clone, Copy, Debug, Default)]
@@ -167,15 +176,10 @@ where
 
     /// To comply with the SD card spec, [sd_init] must be called between powerup and calling this function.
     pub async fn init(&mut self) -> Result<(), Error> {
-        with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let r = self.cmd(idle()).await?;
-                if r == R1_IDLE_STATE {
-                    return Ok(());
-                }
-            }
-        })
-        .await??;
+        let mut poller = Poller::init_retry();
+        while self.cmd(idle()).await? != R1_IDLE_STATE {
+            poller.miss(&mut self.delay).await?;
+        }
 
         // "The SPI interface is initialized in the CRC OFF mode in default"
         // -- SD Part 1 Physical Layer Specification v9.00, Section 7.2.2 Bus Transfer Protection
@@ -183,18 +187,17 @@ where
             return Err(Error::Cmd59Error);
         }
 
-        with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let (r, ext) = self.cmd_ext(send_if_cond(0x1, 0xAA)).await?;
-                if r == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
-                    return Err(Error::UnsupportedCard);
-                }
-                if ext[3] == 0xAA {
-                    return Ok(());
-                }
+        let mut poller = Poller::init_retry();
+        loop {
+            let (r, ext) = self.cmd_ext(send_if_cond(0x1, 0xAA)).await?;
+            if r == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
+                return Err(Error::UnsupportedCard);
             }
-        })
-        .await??;
+            if ext[3] == 0xAA {
+                break;
+            }
+            poller.miss(&mut self.delay).await?;
+        }
 
         trace!("Valid card detected!");
 
@@ -202,30 +205,25 @@ where
         let mut card = Card::default();
 
         // send ACMD41
-        with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let r = self.acmd(sd_send_op_cond(true, false, true, 0x20)).await?;
-                if r == R1_READY_STATE {
-                    return Ok(());
-                }
-            }
-        })
-        .await??;
+        // Card power-up takes up to ~1 s; don't hammer it with ACMD41.
+        let mut poller = Poller::init_retry();
+        while self.acmd(sd_send_op_cond(true, false, true, 0x20)).await? != R1_READY_STATE {
+            poller.miss(&mut self.delay).await?;
+        }
 
         trace!("send_ocr");
-        card.ocr = with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let (r, ext) = self.cmd_ext(cmd::<R3>(0x3A, 0)).await?;
-                if r != R1_READY_STATE {
-                    return Err(Error::Cmd58Error);
-                }
-                let ocr: OCR<SD> = u32::from_be_bytes(ext).into();
-                if !ocr.is_busy() {
-                    return Ok(ocr);
-                }
+        let mut poller = Poller::init_retry();
+        card.ocr = loop {
+            let (r, ext) = self.cmd_ext(cmd::<R3>(0x3A, 0)).await?;
+            if r != R1_READY_STATE {
+                return Err(Error::Cmd58Error);
             }
-        })
-        .await??;
+            let ocr: OCR<SD> = u32::from_be_bytes(ext).into();
+            if !ocr.is_busy() {
+                break ocr;
+            }
+            poller.miss(&mut self.delay).await?;
+        };
 
         trace!("send_csd");
         let mut csd = [0xFFu8; 16];
@@ -420,25 +418,50 @@ where
         Ok(buf[0])
     }
 
+    /// Clock single bytes until `done` accepts one. Paced by [`Poller::backoff`]:
+    /// responses normally arrive within a few bytes, so the first reads run back-to-back.
+    async fn poll_byte_raw(
+        &mut self,
+        timeout_ms: u32,
+        done: impl Fn(u8) -> bool,
+    ) -> Result<u8, Error> {
+        let mut poller = Poller::backoff(timeout_ms);
+        loop {
+            let b = self.read_byte_raw().await?;
+            if done(b) {
+                return Ok(b);
+            }
+            poller.miss(&mut self.delay).await?;
+        }
+    }
+
+    /// Wait until the card releases DO (reads 0xFF). Busy periods after writes last
+    /// from hundreds of µs to hundreds of ms, so poll in chunks and sleep in between.
     async fn wait_idle_raw(&mut self) -> Result<(), Error> {
-        with_timeout(self.delay.clone(), 5000, async {
-            while self.read_byte_raw().await? != 0xFF {}
-            Ok(())
-        })
-        .await?
+        // Fast path: card usually idle already (e.g. before a command).
+        if self.read_byte_raw().await? == 0xFF {
+            return Ok(());
+        }
+        // Extra clocks while busy/idle are harmless; once DO goes high it stays high.
+        let mut buf = [0xFFu8; BUSY_POLL_CHUNK];
+        let mut poller = Poller::backoff(5000);
+        loop {
+            buf.fill(0xFF);
+            self.spi
+                .transfer_in_place(&mut buf)
+                .await
+                .map_err(|_| Error::SpiError)?;
+            if buf[BUSY_POLL_CHUNK - 1] == 0xFF {
+                return Ok(());
+            }
+            poller.miss(&mut self.delay).await?;
+        }
     }
 
     async fn read_data_raw(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        // Poll for start token — CS already LOW, no CS toggles
-        let token = with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let b = self.read_byte_raw().await?;
-                if b != 0xFF {
-                    return Ok(b);
-                }
-            }
-        })
-        .await??;
+        // Poll for start token — CS already LOW, no CS toggles.
+        // Must stay byte-wise: data follows the token immediately.
+        let token = self.poll_byte_raw(1000, |b| b != 0xFF).await?;
 
         if token != DATA_START_BLOCK {
             return Err(Error::RegisterError(token));
@@ -478,15 +501,7 @@ where
         self.spi.write(&crc).await.map_err(|_| Error::SpiError)?;
 
         // Read data response token — still within the SAME CS-LOW window
-        let status = with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let b = self.read_byte_raw().await?;
-                if b != 0xFF {
-                    return Ok(b);
-                }
-            }
-        })
-        .await??;
+        let status = self.poll_byte_raw(1000, |b| b != 0xFF).await?;
 
         if (status & DATA_RES_MASK) != DATA_RES_ACCEPTED {
             return Err(Error::WriteError);
@@ -522,17 +537,7 @@ where
         }
 
         // Poll for R1 (first byte with MSB = 0)
-        let byte = with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let byte = self.read_byte_raw().await?;
-                if byte & 0x80 == 0 {
-                    return Ok(byte);
-                }
-            }
-        })
-        .await??;
-
-        Ok(byte)
+        self.poll_byte_raw(1000, |b| b & 0x80 == 0).await
     }
 
     /// Like `cmd_raw` but also reads 4 extension bytes atomically (for R3/R7 responses).
@@ -673,14 +678,58 @@ where
     }
 }
 
-async fn with_timeout<D: embedded_hal_async::delay::DelayNs, F: Future>(
-    mut delay: D,
-    timeout: u32,
-    fut: F,
-) -> Result<F::Output, Error> {
-    match select(fut, delay.delay_ms(timeout)).await {
-        Either::First(r) => Ok(r),
-        Either::Second(_) => Err(Error::Timeout),
+/// Paces a polling loop and enforces its timeout.
+///
+/// Elapsed time is the sum of sleeps, not a clock reading: `DelayNs` has no clock, and racing the
+/// loop against a timer with `select` never times out when `D` busy-waits instead of yielding.
+/// Transfer time is not counted, so real timeouts run somewhat longer than requested.
+struct Poller {
+    left_us: u32,
+    spins: u32,
+    sleep_us: u32,
+    max_sleep_us: u32,
+}
+
+impl Poller {
+    /// First `SPIN_POLLS` misses run back-to-back, then sleeps back off exponentially.
+    fn backoff(timeout_ms: u32) -> Self {
+        Self {
+            left_us: timeout_ms.saturating_mul(1000),
+            spins: SPIN_POLLS,
+            sleep_us: MIN_BACKOFF_US,
+            max_sleep_us: MAX_BACKOFF_US,
+        }
+    }
+
+    /// Fixed sleep after every miss, 1 s in total.
+    fn init_retry() -> Self {
+        Self {
+            left_us: 1_000_000,
+            spins: 0,
+            sleep_us: INIT_RETRY_US,
+            max_sleep_us: INIT_RETRY_US,
+        }
+    }
+
+    /// Call after each failed poll; errors with [`Error::Timeout`] once the budget is spent.
+    async fn miss<D: embedded_hal_async::delay::DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<(), Error> {
+        if self.spins > 0 {
+            self.spins -= 1;
+            return Ok(());
+        }
+        if self.left_us == 0 {
+            return Err(Error::Timeout);
+        }
+        let us = self.sleep_us.min(self.left_us);
+        delay.delay_us(us).await;
+        // A busy-waiting `DelayNs` never returns `Pending`; give other tasks a turn anyway.
+        yield_now().await;
+        self.left_us -= us;
+        self.sleep_us = (self.sleep_us * 2).min(self.max_sleep_us);
+        Ok(())
     }
 }
 
@@ -710,4 +759,68 @@ fn crc16(data: &[u8]) -> u16 {
         crc ^= (crc & 0xFF) << 5;
     }
     crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::convert::Infallible;
+
+    /// Bus with no card attached: MISO floats high, so every read returns 0xFF.
+    struct NoCard;
+
+    impl embedded_hal_async::spi::ErrorType for NoCard {
+        type Error = Infallible;
+    }
+
+    impl embedded_hal_async::spi::SpiBus for NoCard {
+        async fn read(&mut self, words: &mut [u8]) -> Result<(), Infallible> {
+            words.fill(0xFF);
+            Ok(())
+        }
+        async fn write(&mut self, _: &[u8]) -> Result<(), Infallible> {
+            Ok(())
+        }
+        async fn transfer(&mut self, read: &mut [u8], _: &[u8]) -> Result<(), Infallible> {
+            read.fill(0xFF);
+            Ok(())
+        }
+        async fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Infallible> {
+            words.fill(0xFF);
+            Ok(())
+        }
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    struct Pin;
+
+    impl embedded_hal::digital::ErrorType for Pin {
+        type Error = Infallible;
+    }
+
+    impl embedded_hal::digital::OutputPin for Pin {
+        fn set_low(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+        fn set_high(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    /// Delay that completes without ever returning `Pending`, like a busy-wait implementation.
+    #[derive(Clone)]
+    struct BusyDelay;
+
+    impl embedded_hal_async::delay::DelayNs for BusyDelay {
+        async fn delay_ns(&mut self, _: u32) {}
+    }
+
+    #[test]
+    fn init_times_out_without_card_on_busy_wait_delay() {
+        let mut sd = SdSpi::<_, _, _, aligned::A1>::new(NoCard, Pin, BusyDelay);
+        let r = embassy_futures::block_on(sd.init());
+        assert_eq!(r, Err(Error::Timeout));
+    }
 }

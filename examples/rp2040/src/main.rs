@@ -11,7 +11,6 @@ use embassy_rp::{
     spi::{Async, Config, Spi},
 };
 use embedded_fatfs::FsOptions;
-use embedded_hal_async::delay::DelayNs;
 use heapless::{String, Vec};
 use sdspi::{sd_init, SdSpi};
 use {defmt_rtt as _, panic_probe as _};
@@ -65,7 +64,7 @@ async fn main(_spawner: Spawner) {
             break;
         }
         defmt::info!("Failed to init card, retrying...");
-        embassy_time::Delay.delay_ns(5000u32).await;
+        embassy_time::Timer::after_millis(10).await;
     }
 
     let inner = BufStream::<_, 512>::new(sd);
@@ -95,5 +94,6 @@ async fn main(_spawner: Spawner) {
     .await
     .expect("Filesystem tests failed!");
 
-    loop {}
+    // Park the task; a bare `loop {}` would starve the executor and keep the CPU awake.
+    core::future::pending::<()>().await;
 }

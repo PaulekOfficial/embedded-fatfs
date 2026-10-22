@@ -5,7 +5,6 @@ use block_device_adapters::BufStream;
 use block_device_adapters::BufStreamError;
 use embassy_executor::Spawner;
 use embedded_fatfs::FsOptions;
-use embedded_hal_async::delay::DelayNs;
 use embedded_io_async::{Read, Seek, Write};
 use esp_backtrace as _;
 use esp_hal::{
@@ -84,7 +83,7 @@ async fn main(_spawner: Spawner) {
             break;
         }
         log::info!("Failed to init card, retrying...");
-        embassy_time::Delay.delay_ns(5000u32).await;
+        embassy_time::Timer::after_millis(10).await;
     }
 
     let inner = BufStream::<_, 512>::new(sd);
@@ -113,5 +112,6 @@ async fn main(_spawner: Spawner) {
     .await
     .expect("Filesystem tests failed!");
 
-    loop {}
+    // Park the task; a bare `loop {}` would starve the executor and keep the CPU awake.
+    core::future::pending::<()>().await;
 }
